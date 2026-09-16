@@ -88,6 +88,15 @@ box is reachable from the internet.
 
 ---
 
+## Troubleshooting
+
+- **`EACCES: permission denied, mkdir '/data/db'`** — the container fixes ownership of the
+  bind-mounted `./data` folder itself on startup (via `PUID`/`PGID` in `.env`, default
+  `1000:1000`), so this shouldn't happen on a fresh `./data` folder. If you hit it anyway (e.g.
+  you're re-using a `./data` folder from before this fix, or you set a custom `user:` in
+  compose), run `sudo chown -R 1000:1000 ./data` on the host once (or match `PUID`/`PGID` to
+  whatever `./data` is currently owned by), then `docker compose up -d` again.
+
 ## Notes, limitations & things worth knowing
 
 - **ThePosterDB has no official API.** This app scrapes its public pages the same way community

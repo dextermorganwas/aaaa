@@ -11,6 +11,11 @@ services:
       - "8990:8990"
     env_file:
       - .env
+    environment:
+      # Match your host user so files created under ./data are owned by you, not root.
+      # Find your ids with `id -u` / `id -g` on the host. Defaults to 1000:1000 if unset.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
     volumes:
       - ./data:/data
     healthcheck:
