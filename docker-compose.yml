@@ -1,0 +1,21 @@
+services:
+  art-bridge:
+    # Once you've set up the GitHub repo + Actions workflow (see README), switch this to:
+    #   image: ghcr.io/<your-github-username>/<your-repo-name>:latest
+    # and remove the "build:" line. Until then, this builds from the local source.
+    build: .
+    image: ghcr.io/YOUR_GITHUB_USERNAME/stremio-art-bridge:latest
+    container_name: stremio-art-bridge
+    restart: unless-stopped
+    ports:
+      - "8990:8990"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8990/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

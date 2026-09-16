@@ -1,0 +1,22 @@
+{
+  "name": "stremio-art-bridge",
+  "version": "1.0.0",
+  "description": "Self-hosted artwork resolver/proxy for Stremio (AIOMetadata) that mimics a Plex/Jellyfin-style custom-poster workflow, backed by ThePosterDB, TMDB, TVDB and Metahub.",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "mime-types": "^2.1.35",
+    "p-limit": "^3.1.0"
+  }
+}
