@@ -92,28 +92,39 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-This update changes the database schema (adds a `reason` column and a couple of new tables) and
-rewrites the ThePosterDB scraper to evaluate candidates in parallel instead of one at a time
-(this was the main cause of it feeling slow). The app migrates your existing `./data/db` in
-place automatically on startup - no manual steps needed, just pull the new image and restart:
+This update fixes a real bug: **ThePosterDB was never actually working** - it sits behind
+Cloudflare, which was silently blocking/degrading requests from this app's plain custom
+User-Agent. Every request now presents as a real browser (matching what the reference community
+scrapers do), which is what actually gets real content back. It also switches to reading
+candidate posters directly off the disambiguation page (which already lists exactly one - the
+"Cover" - entry per uploader by default) instead of opening each `/set/{id}` page separately,
+roughly halving the number of requests per lookup.
+
+This also changes the database schema (adds a `reason` column and a couple of new tables) and
+migrates your existing `./data/db` in place automatically on startup - no manual steps needed,
+just pull the new image and restart:
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-**Behavior changes worth knowing about:**
+If you want previously "not found" items to be retried with the fixed scraper right away rather
+than waiting out the `TPDB_NEGATIVE_CACHE_DAYS` cooldown, use "Re-run chain" on those items in the
+admin dashboard (or wait - the cooldown is only a few days).
+
+**Other behavior changes worth knowing about:**
 
 - **ThePosterDB is now skipped inline by default** (`TPDB_INLINE_ENABLED=false`). Every request
   gets an immediate answer from TMDB/TVDB/Metahub while ThePosterDB is checked in the background;
   if it finds a qualifying poster, it silently upgrades the cache for next time. Set
   `TPDB_INLINE_ENABLED=true` if you'd rather the *first* request for an item wait up to
   `TPDB_TIMEOUT_MS` for ThePosterDB before falling through.
-- **ThePosterDB candidate sets are now evaluated in parallel**, not one at a time - this is the
-  actual fix for the slowness; the old sequential loop could take 10-20+ round trips in series
-  for a single title.
-- Confirmed "ThePosterDB has nothing" results are now remembered for `TPDB_NEGATIVE_CACHE_DAYS`
-  (default 3) instead of forever, and provider errors/timeouts back off for
-  `TPDB_ERROR_BACKOFF_MINUTES` (default 20) instead of being retried on every single request.
+- **ThePosterDB candidates are now evaluated in parallel**, not one at a time.
+- A scraping failure (couldn't parse the page at all) is now distinguished from a genuine
+  "ThePosterDB has nothing for this title" - only the latter gets the multi-day negative cache;
+  a parsing failure backs off for just `TPDB_ERROR_BACKOFF_MINUTES` and logs a **warning** (not
+  just a debug line) so a real breakage is visible in your logs instead of looking like a clean
+  miss.
 - A general negative cache (`NEGATIVE_CACHE_TTL_HOURS`, default 12) now covers "nothing was found
   anywhere for this item" so a bad/mismatched id doesn't hit every provider on every request.
 - Replacing an item's art (auto re-resolution, an admin override, or a background ThePosterDB
@@ -123,6 +134,11 @@ docker compose pull && docker compose up -d
   blank.
 - Each resolved art entry now records *why* it was picked (which chain step matched), shown as
   "Why:" in the admin dashboard.
+- **"Browse all options" now defaults to only what the real chain would actually pick from**
+  (English/original-language posters, textless backdrops, English/original-language logos, plus
+  ThePosterDB and Metahub which are chain-relevant by construction) - with a "Show N more
+  options" button per art type to reveal everything else (other languages, non-textless
+  backdrops) for manual picking.
 
 ## Troubleshooting
 

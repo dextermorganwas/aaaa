@@ -130,7 +130,13 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
     db.setTpdbError(mediaRow.id);
     throw e;
   }
-  const { postersPageId, result } = outcome;
+  const { postersPageId, result, scraperError } = outcome;
+  if (scraperError) {
+    // Something about the page couldn't be parsed - back off briefly like any other error,
+    // but don't record a confirmed "not found" (which would stick around for days).
+    db.setTpdbError(mediaRow.id);
+    return null;
+  }
   db.setTpdbMatch(mediaRow.id, postersPageId, !result);
   if (!result) return null;
 
@@ -143,7 +149,7 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
     buffer: dl.buffer,
     contentType: dl.contentType,
     language: result.language,
-    reason: `ThePosterDB: English, Original variation${ctx.type === 'series' ? ', Show Cover' : ''} (set ${result.setId})`,
+    reason: `ThePosterDB: English, Original variation${ctx.type === 'series' ? ', Show Cover' : ''} (set ${result.setId || 'n/a'})`,
   };
 }
 

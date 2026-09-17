@@ -179,29 +179,64 @@ async function clearOverride(mediaId, artType) {
 async function browse(media, artType, section) {
   const grid = section.querySelector('.options-grid');
   grid.classList.remove('hidden');
-  grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:16px;">Loading options from all providers (this opens several pages on ThePosterDB, may take a few seconds)...</div>`;
+  grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:16px;">Loading options from all providers...</div>`;
   try {
     const data = await api(`/media/${media.id}/browse`);
-    const options = data[artType] || [];
-    if (!options.length) {
-      grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">No candidates found from any provider.</div>`;
-      return;
-    }
-    grid.innerHTML = options
-      .map(
-        (o, i) => `
+    const bucket = data[artType] || { primary: [], more: [] };
+    renderOptionBucket(grid, media.id, artType, bucket);
+  } catch (e) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">Failed to load options: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderOptionCards(container, mediaId, artType, options) {
+  container.innerHTML = options
+    .map(
+      (o, i) => `
       <div class="option-card ${artType}" data-idx="${i}">
         <img loading="lazy" src="${o.imageUrl}" alt="">
         <div class="opt-meta">${o.source}${o.label ? ` · ${o.label}` : ''}</div>
       </div>`
-      )
-      .join('');
-    grid.querySelectorAll('.option-card').forEach((el) => {
-      const opt = options[Number(el.dataset.idx)];
-      el.addEventListener('click', () => applyOverride(media.id, artType, opt));
+    )
+    .join('');
+  container.querySelectorAll('.option-card').forEach((el) => {
+    const opt = options[Number(el.dataset.idx)];
+    el.addEventListener('click', () => applyOverride(mediaId, artType, opt));
+  });
+}
+
+function renderOptionBucket(grid, mediaId, artType, bucket) {
+  grid.innerHTML = '';
+  if (!bucket.primary.length && !bucket.more.length) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">No candidates found from any provider.</div>`;
+    return;
+  }
+  const primaryWrap = document.createElement('div');
+  primaryWrap.className = 'options-grid';
+  primaryWrap.style.marginTop = '0';
+  grid.appendChild(primaryWrap);
+  if (bucket.primary.length) {
+    renderOptionCards(primaryWrap, mediaId, artType, bucket.primary);
+  } else {
+    primaryWrap.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">Nothing matches the chain's own criteria (e.g. English/textless) - try "show more options".</div>`;
+  }
+  if (bucket.more.length) {
+    const moreBtn = document.createElement('button');
+    moreBtn.className = 'btn';
+    moreBtn.style.marginTop = '10px';
+    moreBtn.textContent = `Show ${bucket.more.length} more option(s) (other languages / not chain-matching)`;
+    const moreWrap = document.createElement('div');
+    moreWrap.className = 'options-grid hidden';
+    moreBtn.addEventListener('click', () => {
+      moreWrap.classList.toggle('hidden');
+      moreBtn.classList.toggle('hidden');
+      if (!moreWrap.dataset.rendered) {
+        renderOptionCards(moreWrap, mediaId, artType, bucket.more);
+        moreWrap.dataset.rendered = '1';
+      }
     });
-  } catch (e) {
-    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">Failed to load options: ${escapeHtml(e.message)}</div>`;
+    grid.appendChild(moreBtn);
+    grid.appendChild(moreWrap);
   }
 }
 
