@@ -118,25 +118,40 @@ async function getCoverCandidates(postersPageId, maxCandidates) {
   return { candidates, parsedRows };
 }
 
-/** Step 3: open an individual /poster/{assetId} page to read Language / Type / Variation. */
+/** Step 3: open an individual /poster/{assetId} page to read Language / Type / Variation, plus
+ *  the poster's own caption. Verified against real fetched pages: the three fields render as
+ *  separate "**Label:** Value" lines (NOT one line joined by separators, which an earlier
+ *  version of this scraper wrongly assumed), and the caption is reliably available in the
+ *  page's own <title> tag as "{Caption} Poster | TPDb". */
+function sliceField(text, label, stopMarkers) {
+  const re = new RegExp(`${label}:\\s*`, 'i');
+  const m = re.exec(text);
+  if (!m) return null;
+  let value = text.slice(m.index + m[0].length, m.index + m[0].length + 60);
+  for (const marker of stopMarkers) {
+    const idx = value.search(new RegExp(marker, 'i'));
+    if (idx !== -1) value = value.slice(0, idx);
+  }
+  value = value.trim();
+  return value || null;
+}
+
 async function getPosterMeta(assetId) {
   const html = await get(`/poster/${assetId}`);
   if (!html) return null;
-  const text = html.replace(/<[^>]+>/g, ' ').replace(/&middot;|·/g, '|').replace(/\s+/g, ' ');
+  const $ = cheerio.load(html);
 
-  const metaMatch = text.match(
-    /Language:\s*([A-Za-z\- ]+?)\s*\|\s*Type:\s*([A-Za-z\- ]+?)\s*\|\s*Variation:\s*([A-Za-z' \-]+?)\s*(?:\||Notes|$)/i
-  );
-  if (!metaMatch) return null;
+  const titleTag = $('title').text().trim();
+  const caption = titleTag ? titleTag.replace(/\s*Poster\s*\|\s*TPDb\s*$/i, '').trim() : null;
 
-  const captionMatch = text.match(/([^|]{1,100}?)\s+by\s+[^|]{1,60}?\|\s*Uploaded:/i);
+  const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
+  const stopMarkers = ['Type:', 'Variation:', 'Notes\\b', 'RELATED:', 'Language:'];
+  const language = sliceField(bodyText, 'Language', stopMarkers);
+  const type = sliceField(bodyText, 'Type', stopMarkers);
+  const variation = sliceField(bodyText, 'Variation', stopMarkers);
 
-  return {
-    language: metaMatch[1].trim(),
-    type: metaMatch[2].trim(),
-    variation: metaMatch[3].trim(),
-    caption: captionMatch ? captionMatch[1].trim() : null,
-  };
+  if (!language && !type && !variation) return null;
+  return { language, type, variation, caption };
 }
 
 function isCoverCaption(caption) {

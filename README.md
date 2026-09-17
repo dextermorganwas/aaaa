@@ -92,13 +92,20 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-This update fixes a real bug: **ThePosterDB was never actually working** - it sits behind
-Cloudflare, which was silently blocking/degrading requests from this app's plain custom
-User-Agent. Every request now presents as a real browser (matching what the reference community
-scrapers do), which is what actually gets real content back. It also switches to reading
-candidate posters directly off the disambiguation page (which already lists exactly one - the
-"Cover" - entry per uploader by default) instead of opening each `/set/{id}` page separately,
-roughly halving the number of requests per lookup.
+**Latest fix:** the `Language:`/`Type:`/`Variation:` fields on a poster's detail page render as
+three separate lines, not one line joined by a separator - an earlier version of this scraper
+assumed a separator that doesn't exist, so it found real candidates but could never confirm
+their language/variation and rejected all of them. Verified directly against live pages this
+time (not inferred) and rewritten to match the real structure. The poster's caption is now also
+read from the page's own `<title>` tag (`"{Caption} Poster | TPDb"`), which is far more reliable
+than the previous body-text approach.
+
+Earlier fix in this same update: ThePosterDB sits behind Cloudflare, which was silently
+blocking/degrading requests from this app's plain custom User-Agent. Every request now presents
+as a real browser (matching what the reference community scrapers do). It also reads candidate
+posters directly off the disambiguation page (which already lists exactly one - the "Cover" -
+entry per uploader by default, confirmed by fetching it directly) instead of opening each
+`/set/{id}` page separately.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,
