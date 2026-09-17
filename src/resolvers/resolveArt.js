@@ -148,7 +148,7 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
     buffer: dl.buffer,
     contentType: dl.contentType,
     language: result.language,
-    reason: `ThePosterDB: English, Original variation${ctx.type === 'series' ? ', Show Cover' : ''} (set ${result.setId || 'n/a'})`,
+    reason: `ThePosterDB: English, Original variation${ctx.type === 'series' ? ', Show Cover' : ''}, top result by Downloads`,
   };
 }
 

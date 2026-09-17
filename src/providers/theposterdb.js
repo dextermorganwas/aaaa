@@ -6,19 +6,27 @@
 // 1. ThePosterDB sits behind Cloudflare and appears to degrade/block non-browser User-Agents -
 //    every request here spoofs a real Chrome UA + client-hint headers, matching what the
 //    reference scrapers do. Without this, every request silently comes back empty.
-// 2. The disambiguation page (/posters/{id}) with NO query params already shows exactly one
-//    row per uploader/set, and that row is always the "Show Cover" (for series) - verified by
-//    fetching it directly and finding zero season-suffixed captions in the default view, and by
-//    the page's own filter UI showing Season=Show Cover and Variation=Original as the
-//    pre-selected defaults (only Language defaults to "All"). That means candidate poster ids
-//    can be read straight off this page, without needing to open each /set/{id} separately.
-// 3. cheerio's .text() includes <script>/<style> contents by default, and this is a Livewire/
-//    Alpine-heavy site with embedded JSON state blobs - getPosterMeta() strips those out before
-//    extracting text, since leaving them in was silently corrupting field extraction for some
-//    titles (whichever ones happened to have a matching substring earlier in the page).
-// 4. Requests to ThePosterDB are rate-limited to their own, lower concurrency cap
-//    (TPDB_MAX_CONCURRENT, separate from MAX_CONCURRENT_FETCHES) to be a reasonable citizen
-//    toward a site with no official API, independent of how much TMDB/TVDB traffic is allowed.
+// 2. BIG ONE: the disambiguation page's filter UI (View/Textless/Language/Season/Sort/Variation)
+//    actually syncs to the URL as real query parameters (confirmed directly from a user's own
+//    browser session), so the exact filtering the site's own UI does can be replicated with a
+//    single GET instead of opening every candidate's own detail page to check its language and
+//    variation. Confirmed working params:
+//      ?textless=All&language=en&season=n&sort=Downloads&variation=orig
+//    - textless: All | Non-Textless | Textless (posters always use All here)
+//    - language: ISO 639-1 2-letter code (en, fr, ...)
+//    - season: only present for series; "n" = Show Cover. Omitted entirely for movies.
+//    - sort: Downloads (matches the site's own "popularity" ordering)
+//    - variation: orig = Original (abbreviated, not the full word)
+//    Requesting the page already filtered this way means the first candidate in the resulting
+//    grid IS a qualifying English/Original(/Show Cover) poster - no separate detail-page
+//    verification needed for the main chain at all. This is a large simplification over an
+//    earlier version of this scraper that opened every candidate's own /poster/{id} page and
+//    parsed free text off it, which was slow and repeatedly broke on parsing edge cases.
+// 3. cheerio's .text() includes <script>/<style> contents by default - still relevant for the
+//    admin "browse" detail lookups below, which strip them before extracting text.
+// 4. Requests to ThePosterDB are rate-limited on two axes: a concurrency cap
+//    (TPDB_MAX_CONCURRENT) and a minimum spacing between requests (TPDB_MIN_REQUEST_INTERVAL_MS)
+//    - concurrency alone doesn't bound total throughput over time, spacing does.
 const cheerio = require('cheerio');
 const pLimit = require('p-limit');
 const config = require('../config');
@@ -27,6 +35,13 @@ const { fetchText, fetchBuffer } = require('../lib/httpClient');
 
 const BASE = 'https://theposterdb.com';
 const tpdbLimit = pLimit(config.tpdbMaxConcurrent);
+
+let lastRequestAt = 0;
+function throttle() {
+  const wait = Math.max(0, lastRequestAt + config.tpdbMinRequestIntervalMs - Date.now());
+  lastRequestAt = Date.now() + wait;
+  return wait > 0 ? new Promise((resolve) => setTimeout(resolve, wait)) : Promise.resolve();
+}
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -50,7 +65,10 @@ function normalizeTitle(t) {
 
 async function get(path) {
   const url = path.startsWith('http') ? path : `${BASE}${path}`;
-  return tpdbLimit(() => fetchText(url, { timeoutMs: config.tpdbTimeoutMs, headers: BROWSER_HEADERS }));
+  return tpdbLimit(async () => {
+    await throttle();
+    return fetchText(url, { timeoutMs: config.tpdbTimeoutMs, headers: BROWSER_HEADERS });
+  });
 }
 
 /** Step 1: find the /posters/{id} "all posters for this title" disambiguation page. */
@@ -88,178 +106,119 @@ async function findPostersPageId({ title, year, mediaType }) {
   return loose ? loose.id : null;
 }
 
-/**
- * Step 2: read candidate poster ids directly off the disambiguation page's default (Cover-only)
- * grid, in the site's own "Logical" order - this IS "the first one that comes up". Each row also
- * carries which /set/{id} it belongs to and a Movie/Show badge, for extra validation.
- */
-async function getCoverCandidates(postersPageId, maxCandidates) {
-  const html = await get(`/posters/${postersPageId}`);
-  if (!html) return { candidates: [], parsedRows: 0 };
+/** Builds a disambiguation-page URL using the site's own real filter query params. */
+function buildFilteredUrl(postersPageId, { mediaType, language, variation } = {}) {
+  const params = new URLSearchParams();
+  params.set('textless', 'All');
+  if (language) params.set('language', language);
+  if (mediaType === 'series') params.set('season', 'n'); // "n" = Show Cover
+  params.set('sort', 'Downloads');
+  if (variation) params.set('variation', variation);
+  return `/posters/${postersPageId}?${params.toString()}`;
+}
+
+/** Reads candidate poster ids off a (possibly filtered) disambiguation page, in the page's own
+ *  order (which, sorted by Downloads, means "most popular first"). */
+async function getCandidateIds(postersPageId, opts = {}) {
+  const html = await get(buildFilteredUrl(postersPageId, opts));
+  if (!html) return [];
   const $ = cheerio.load(html);
-  const candidates = [];
+  const ids = [];
+  const seen = new Set();
 
   $('div.col-6.col-lg-2.p-1').each((_, el) => {
-    if (candidates.length >= maxCandidates) return;
-    const card = $(el);
-    const posterId = card.find('div.overlay').attr('data-poster-id');
-    if (!posterId) return;
-    const setHref = card.find('a[href*="/set/"]').first().attr('href') || '';
-    const setMatch = setHref.match(/\/set\/(\d+)/);
-    const mediaTypeLabel = card.find('a[data-toggle="tooltip"][data-placement="top"]').attr('title') || '';
-    candidates.push({ assetId: posterId, setId: setMatch ? setMatch[1] : null, mediaTypeLabel: mediaTypeLabel.trim() });
+    const posterId = $(el).find('div.overlay').attr('data-poster-id');
+    if (posterId && !seen.has(posterId)) {
+      seen.add(posterId);
+      ids.push(posterId);
+    }
   });
 
-  const parsedRows = candidates.length;
-
-  if (!candidates.length) {
-    // Regex fallback keyed off the data-poster-id attribute alone - loses the set id/media type
-    // badge, but the individual /poster/{id} detail page (fetched next) has its own Type field.
+  if (!ids.length) {
     const re = /data-poster-id=["'](\d+)["']/g;
-    const seen = new Set();
     let m;
-    while ((m = re.exec(html)) && candidates.length < maxCandidates) {
-      if (seen.has(m[1])) continue;
-      seen.add(m[1]);
-      candidates.push({ assetId: m[1], setId: null, mediaTypeLabel: '' });
+    while ((m = re.exec(html))) {
+      if (!seen.has(m[1])) {
+        seen.add(m[1]);
+        ids.push(m[1]);
+      }
     }
   }
 
-  return { candidates, parsedRows };
-}
-
-/** Step 3: open an individual /poster/{assetId} page to read Language / Type / Variation, plus
- *  the poster's own caption. Verified against real fetched pages: the three fields render as
- *  separate "**Label:** Value" lines (NOT one line joined by separators, which an earlier
- *  version of this scraper wrongly assumed), and the caption is reliably available in the
- *  page's own <title> tag as "{Caption} Poster | TPDb". */
-function sliceField(text, label, stopMarkers) {
-  const re = new RegExp(`${label}:\\s*`, 'i');
-  const m = re.exec(text);
-  if (!m) return null;
-  let value = text.slice(m.index + m[0].length, m.index + m[0].length + 60);
-  for (const marker of stopMarkers) {
-    const idx = value.search(new RegExp(marker, 'i'));
-    if (idx !== -1) value = value.slice(0, idx);
-  }
-  value = value.trim();
-  return value || null;
-}
-
-async function getPosterMeta(assetId) {
-  const html = await get(`/poster/${assetId}`);
-  if (!html) return null;
-  const $ = cheerio.load(html);
-  // .text() includes <script>/<style> contents by default - this site is Livewire/Alpine-heavy
-  // and embeds JSON state blobs that can coincidentally contain "Type:"/"Language:"-like
-  // substrings, which was silently corrupting extraction for some titles. Strip them first.
-  $('script, style, noscript, template').remove();
-
-  const titleTag = $('title').text().trim();
-  const caption = titleTag ? titleTag.replace(/\s*Poster\s*\|\s*TPDb\s*$/i, '').trim() : null;
-
-  const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
-  const stopMarkers = ['Type:', 'Variation:', 'Notes\\b', 'RELATED:', 'Language:'];
-  const language = sliceField(bodyText, 'Language', stopMarkers);
-  const type = sliceField(bodyText, 'Type', stopMarkers);
-  const variation = sliceField(bodyText, 'Variation', stopMarkers);
-
-  if (!language && !type && !variation) return null;
-  return { language, type, variation, caption };
-}
-
-function isCoverCaption(caption) {
-  if (!caption) return true; // unknown caption - don't reject on this basis alone
-  return !/\s-\s*(season\s+\d+|specials)\s*$/i.test(caption);
-}
-
-/** Fetches and validates one candidate's detail page. Returns the fully-evaluated candidate
- *  (regardless of whether it qualifies) or null if it couldn't be fetched/parsed at all. */
-async function evaluateCandidate(candidate, { mediaType }) {
-  const meta = await getPosterMeta(candidate.assetId);
-  if (!meta) return null;
-  const expectedType = mediaType === 'series' ? 'show' : 'movie';
-  const typeOk = new RegExp(expectedType, 'i').test(meta.type);
-  const coverOk = mediaType !== 'series' || isCoverCaption(meta.caption);
-  return {
-    setId: candidate.setId,
-    assetId: candidate.assetId,
-    imageUrl: assetImageUrl(candidate.assetId),
-    qualifiesType: typeOk && coverOk,
-    ...meta,
-  };
+  return ids;
 }
 
 /**
- * The full chain: search -> disambiguation page (candidates read directly, Cover-only by
- * default) -> evaluate every candidate's detail page IN PARALLEL -> return the first, in the
- * site's own order, that is English + Original (+ a real Show Cover, for series).
+ * The full chain: search -> disambiguation page requested PRE-FILTERED to
+ * English + Original (+ Show Cover for series), sorted by Downloads -> take the first result.
+ * This is what the site's own filter UI does when a person sets it up manually.
  *
- * Distinguishes "TPDB genuinely has nothing" (result: null, scraperError: false) from
- * "we couldn't read TPDB's page at all" (scraperError: true) so the caller doesn't cache a
- * scraping failure as a confirmed negative for days.
+ * Distinguishes "TPDB genuinely has nothing matching" from "we couldn't read TPDB's page at
+ * all" by also checking the unfiltered page when the filtered one comes back empty - if EVEN
+ * the unfiltered page yields nothing, that's a scraper problem, not a real negative.
  */
-function summarizeEvaluations(evaluations, mediaType) {
-  const parsed = evaluations.filter(Boolean);
-  if (!parsed.length) return 'candidates found but none could be read';
-  const wantType = mediaType === 'series' ? 'show' : 'movie';
-  const typeOkCount = parsed.filter((e) => new RegExp(wantType, 'i').test(e.type || '')).length;
-  const englishCount = parsed.filter((e) => /^english$/i.test(e.language || '')).length;
-  const originalCount = parsed.filter((e) => /^original$/i.test(e.variation || '')).length;
-  const coverCount = mediaType === 'series' ? parsed.filter((e) => isCoverCaption(e.caption)).length : parsed.length;
-  const parts = [`${parsed.length} candidate(s) read`, `${typeOkCount} right type`, `${englishCount} English`, `${originalCount} Original variation`];
-  if (mediaType === 'series') parts.push(`${coverCount} Show Cover`);
-  return parts.join(', ');
-}
-
 async function findEnglishOriginalPoster({ title, year, mediaType }) {
   const postersPageId = await findPostersPageId({ title, year, mediaType });
   if (!postersPageId) return { postersPageId: null, result: null, scraperError: false, reason: 'no matching title page found in search' };
 
-  const { candidates, parsedRows } = await getCoverCandidates(postersPageId, config.tpdbMaxCandidates);
-  if (!candidates.length) {
-    // The disambiguation page resolved, but we couldn't extract a single poster id from it -
-    // that's suspicious (TPDB markup likely changed), not a genuine "no posters" situation.
-    logger.warn(`ThePosterDB: found title page /posters/${postersPageId} but could not parse any poster candidates from it - the scraper may need updating.`);
-    return { postersPageId, result: null, scraperError: true, reason: 'found title page but could not parse any candidates (scraper may need updating)' };
+  const filtered = await getCandidateIds(postersPageId, { mediaType, language: 'en', variation: 'orig' });
+  if (filtered.length) {
+    const assetId = filtered[0];
+    return {
+      postersPageId,
+      result: { assetId, imageUrl: assetImageUrl(assetId), language: 'English', variation: 'Original' },
+      scraperError: false,
+      reason: null,
+    };
   }
 
-  const evaluations = await Promise.all(
-    candidates.map((c) =>
-      evaluateCandidate(c, { mediaType }).catch((e) => {
-        logger.debug(`TPDB candidate ${c.assetId} evaluation failed:`, e.message);
-        return null;
-      })
-    )
-  );
-
-  const parsedCount = evaluations.filter(Boolean).length;
-  if (parsedCount === 0 && parsedRows > 0) {
-    logger.warn(`ThePosterDB: found ${candidates.length} candidate(s) for /posters/${postersPageId} but none of their detail pages could be read - the scraper may need updating.`);
-    return { postersPageId, result: null, scraperError: true, reason: `found ${candidates.length} candidates but none of their detail pages could be read (scraper may need updating)` };
+  const unfiltered = await getCandidateIds(postersPageId, { mediaType });
+  if (!unfiltered.length) {
+    logger.warn(`ThePosterDB: found title page /posters/${postersPageId} but could not parse any poster candidates from it (filtered or unfiltered) - the scraper may need updating.`);
+    return { postersPageId, result: null, scraperError: true, reason: 'found title page but could not parse any candidates at all (scraper may need updating)' };
   }
-
-  for (const evalResult of evaluations) {
-    if (evalResult && evalResult.qualifiesType && /^english$/i.test(evalResult.language) && /^original$/i.test(evalResult.variation)) {
-      return { postersPageId, result: evalResult, scraperError: false, reason: null };
-    }
-  }
-  return { postersPageId, result: null, scraperError: false, reason: summarizeEvaluations(evaluations, mediaType) };
+  return {
+    postersPageId,
+    result: null,
+    scraperError: false,
+    reason: `ThePosterDB has ${unfiltered.length} poster(s) for this title, but none in English/Original${mediaType === 'series' ? '/Show Cover' : ''}`,
+  };
 }
 
 async function downloadPoster(assetId) {
   const url = assetImageUrl(assetId);
-  const result = await tpdbLimit(() => fetchBuffer(url, { timeoutMs: config.tpdbTimeoutMs * 3, headers: BROWSER_HEADERS }));
+  const result = await tpdbLimit(async () => {
+    await throttle();
+    return fetchBuffer(url, { timeoutMs: config.tpdbTimeoutMs * 3, headers: BROWSER_HEADERS });
+  });
   if (!result) return null;
   return { ...result, sourceUrl: url };
+}
+
+/** Used only by the admin "browse all options" view: a broader, unfiltered candidate list so a
+ *  human can see (and override to) posters in other languages/variations too. Each entry is
+ *  labeled generically since we no longer open every candidate's own detail page to confirm its
+ *  exact language/variation (that was the slow, fragile part) - the primary (English/Original)
+ *  bucket is still exact, built the same way the live resolver is. */
+async function browseCandidates(postersPageId, { mediaType }) {
+  const [primary, everything] = await Promise.all([
+    getCandidateIds(postersPageId, { mediaType, language: 'en', variation: 'orig' }),
+    getCandidateIds(postersPageId, { mediaType }),
+  ]);
+  const primarySet = new Set(primary);
+  const more = everything.filter((id) => !primarySet.has(id)).slice(0, config.tpdbMaxCandidates);
+  return {
+    primary: primary.map((assetId) => ({ assetId, language: 'English', variation: 'Original' })),
+    more: more.map((assetId) => ({ assetId, language: null, variation: null })),
+  };
 }
 
 // Bump this whenever a change to the matching/parsing logic above could flip a previous
 // verdict (a "not found" that should now be found, or vice versa) - db.js uses it to
 // auto-invalidate remembered ThePosterDB verdicts on startup so old bugs don't linger as
-// cooldowns after they're fixed. Last bumped: fixed <script>/<style> content leaking into
-// text extraction, which was corrupting Language/Type/Variation parsing for some titles.
-const TPDB_SCRAPER_VERSION = 5;
+// cooldowns after they're fixed. Last bumped: switched from per-candidate detail-page scraping
+// to the site's own real filter query parameters (?language=en&season=n&variation=orig&...).
+const TPDB_SCRAPER_VERSION = 6;
 
 module.exports = {
   TPDB_SCRAPER_VERSION,
@@ -267,7 +226,6 @@ module.exports = {
   downloadPoster,
   assetImageUrl,
   findPostersPageId,
-  getCoverCandidates,
-  getPosterMeta,
-  evaluateCandidate,
+  getCandidateIds,
+  browseCandidates,
 };

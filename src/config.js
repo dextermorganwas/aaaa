@@ -72,13 +72,19 @@ module.exports = {
   // temporarily), with the same background-backfill behaviour either way once that wait expires.
   tpdbInlineEnabled: bool(process.env.TPDB_INLINE_ENABLED, false),
 
-  // How many candidate ThePosterDB sets to actually open (each costs one request) before
-  // giving up on a title. Keep this modest - it directly controls TPDB load & latency.
-  tpdbMaxCandidates: int(process.env.TPDB_MAX_CANDIDATES, 10),
+  // Caps how many extra ("other language/variation") ThePosterDB candidates the admin "browse
+  // all options" view shows beyond the primary English/Original set - purely a display limit
+  // now, not a request-count knob, since the whole candidate list comes from one page fetch.
+  tpdbMaxCandidates: int(process.env.TPDB_MAX_CANDIDATES, 24),
   // ThePosterDB has no official API and no rate-limit contract, so its own concurrency cap is
   // intentionally lower and separate from MAX_CONCURRENT_FETCHES (which also serves TMDB/TVDB,
   // both fine with more parallel load). This is the main lever for how fast this app hits TPDB.
-  tpdbMaxConcurrent: int(process.env.TPDB_MAX_CONCURRENT, 4),
+  tpdbMaxConcurrent: int(process.env.TPDB_MAX_CONCURRENT, 3),
+  // Minimum spacing (ms) between consecutive ThePosterDB requests, on top of the concurrency
+  // cap above - concurrency alone doesn't bound total throughput over time, this does. With the
+  // current scraper (2-3 requests per title resolution), the default keeps steady-state
+  // throughput to roughly 3-4 requests/second even under a large catalog-scan burst.
+  tpdbMinRequestIntervalMs: int(process.env.TPDB_MIN_REQUEST_INTERVAL_MS, 300),
 
   // --- Placeholder behaviour ---
   // If true, a request that resolves to "no art anywhere" gets a 302 to placeholderUrl

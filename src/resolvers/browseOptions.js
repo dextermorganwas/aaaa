@@ -18,39 +18,32 @@ const metahub = require('../providers/metahub');
 const langMap = require('../lib/langMap');
 const { buildContext } = require('./resolveArt');
 
-/** Evaluates every candidate on ThePosterDB's disambiguation page for this title IN PARALLEL
- *  (same approach the live resolver uses), so the admin can see language/variation for all of
- *  them - not just the first English+Original hit the live resolver would stop at. */
+/** ThePosterDB candidates, already split into primary (English/Original, matching what the live
+ *  resolver would pick from) and more (everything else on the title's page) - built from the
+ *  site's own real filter query params rather than per-candidate detail-page scraping. */
 async function listTpdbCandidates(ctx, mediaRow) {
   const title = ctx.title || mediaRow.title;
   const year = ctx.year || mediaRow.year;
-  if (!title) return [];
+  if (!title) return { primary: [], more: [] };
 
   const postersPageId = await tpdb.findPostersPageId({ title, year, mediaType: ctx.type }).catch(() => null);
-  if (!postersPageId) return [];
+  if (!postersPageId) return { primary: [], more: [] };
 
-  const { candidates } = await tpdb.getCoverCandidates(postersPageId, config.tpdbMaxCandidates).catch(() => ({ candidates: [] }));
+  const { primary, more } = await tpdb.browseCandidates(postersPageId, { mediaType: ctx.type }).catch((e) => {
+    logger.debug('TPDB browse failed:', e.message);
+    return { primary: [], more: [] };
+  });
 
-  const evaluations = await Promise.all(
-    candidates.map((c) =>
-      tpdb.evaluateCandidate(c, { mediaType: ctx.type }).catch((e) => {
-        logger.debug(`TPDB browse candidate ${c.assetId} failed:`, e.message);
-        return null;
-      })
-    )
-  );
+  const toOption = (c) => ({
+    source: 'theposterdb',
+    id: c.assetId,
+    imageUrl: tpdb.assetImageUrl(c.assetId),
+    language: c.language,
+    variation: c.variation,
+    label: [c.language, c.variation].filter(Boolean).join(' / ') || 'ThePosterDB',
+  });
 
-  return evaluations
-    .filter(Boolean)
-    .map((r) => ({
-      source: 'theposterdb',
-      id: r.assetId,
-      setId: r.setId,
-      imageUrl: r.imageUrl,
-      language: r.language,
-      variation: r.variation,
-      label: [r.language, r.variation].filter(Boolean).join(' / ') || `set ${r.setId || r.assetId}`,
-    }));
+  return { primary: primary.map(toOption), more: more.map(toOption) };
 }
 
 function splitByLanguage(items, wantLangs) {
@@ -75,13 +68,13 @@ async function browse(mediaRow) {
     tvdb.getArtworks({ type: ctx.type, tvdbId: ctx.tvdbId, imdbId: ctx.imdbId, tmdbId: ctx.tmdbId }).catch(() => null),
     listTpdbCandidates(ctx, mediaRow).catch((e) => {
       logger.debug('TPDB browse failed:', e.message);
-      return [];
+      return { primary: [], more: [] };
     }),
   ]);
 
   const tvdbOriginalLang = langMap.toTvdbLang(ctx.originalLanguage);
 
-  const posters = { primary: [...tpdbList], more: [] };
+  const posters = { primary: [...tpdbList.primary], more: [...tpdbList.more] };
   const backdrops = { primary: [], more: [] };
   const logos = { primary: [], more: [] };
 
