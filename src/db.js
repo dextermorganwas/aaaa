@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS art (
   local_path TEXT,
   content_type TEXT,
   language TEXT,
+  reason TEXT,
   is_override INTEGER DEFAULT 0,
   cache_forever INTEGER DEFAULT 0,
   fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -51,7 +52,15 @@ CREATE TABLE IF NOT EXISTS tpdb_match_cache (
   media_id INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
   posters_page_id TEXT,
   not_found INTEGER DEFAULT 0,
+  last_error_at TEXT,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS negative_cache (
+  media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+  art_type TEXT NOT NULL,
+  checked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (media_id, art_type)
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -62,6 +71,19 @@ CREATE TABLE IF NOT EXISTS request_log (
 );
 CREATE INDEX IF NOT EXISTS idx_request_log_media ON request_log(media_id);
 `);
+
+// Safe migrations for databases created by earlier versions of this app, which won't have the
+// columns added above. SQLite has no "ADD COLUMN IF NOT EXISTS", so just swallow the "duplicate
+// column" error when it already exists.
+function safeAddColumn(table, columnDef) {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+  } catch (e) {
+    if (!/duplicate column/i.test(e.message)) throw e;
+  }
+}
+safeAddColumn('art', 'reason TEXT');
+safeAddColumn('tpdb_match_cache', 'last_error_at TEXT');
 
 logger.info(`SQLite database ready at ${config.dbPath}`);
 
@@ -167,6 +189,7 @@ function upsertArt(mediaId, artType, data) {
     localPath: data.localPath || null,
     contentType: data.contentType || null,
     language: data.language || null,
+    reason: data.reason || null,
     isOverride: data.isOverride ? 1 : 0,
     cacheForever: data.cacheForever ? 1 : 0,
     expiresAt: data.expiresAt || null,
@@ -174,16 +197,16 @@ function upsertArt(mediaId, artType, data) {
   if (existing) {
     db.prepare(
       `UPDATE art SET source=@source, source_ref=@sourceRef, source_url=@sourceUrl, local_path=@localPath,
-         content_type=@contentType, language=@language, is_override=@isOverride, cache_forever=@cacheForever,
+         content_type=@contentType, language=@language, reason=@reason, is_override=@isOverride, cache_forever=@cacheForever,
          fetched_at=CURRENT_TIMESTAMP, expires_at=@expiresAt
        WHERE media_id=@mediaId AND art_type=@artType`
     ).run(payload);
   } else {
     db.prepare(
       `INSERT INTO art (media_id, art_type, source, source_ref, source_url, local_path, content_type, language,
-         is_override, cache_forever, expires_at)
+         reason, is_override, cache_forever, expires_at)
        VALUES (@mediaId, @artType, @source, @sourceRef, @sourceUrl, @localPath, @contentType, @language,
-         @isOverride, @cacheForever, @expiresAt)`
+         @reason, @isOverride, @cacheForever, @expiresAt)`
     ).run(payload);
   }
   return getArt(mediaId, artType);
@@ -201,11 +224,36 @@ function getTpdbMatch(mediaId) {
 
 function setTpdbMatch(mediaId, postersPageId, notFound = false) {
   db.prepare(
-    `INSERT INTO tpdb_match_cache (media_id, posters_page_id, not_found, updated_at)
-     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    `INSERT INTO tpdb_match_cache (media_id, posters_page_id, not_found, last_error_at, updated_at)
+     VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP)
      ON CONFLICT(media_id) DO UPDATE SET posters_page_id=excluded.posters_page_id,
-       not_found=excluded.not_found, updated_at=CURRENT_TIMESTAMP`
+       not_found=excluded.not_found, last_error_at=NULL, updated_at=CURRENT_TIMESTAMP`
   ).run(mediaId, postersPageId || null, notFound ? 1 : 0);
+}
+
+function setTpdbError(mediaId) {
+  db.prepare(
+    `INSERT INTO tpdb_match_cache (media_id, last_error_at, updated_at)
+     VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT(media_id) DO UPDATE SET last_error_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP`
+  ).run(mediaId);
+}
+
+// ---------- negative cache ("checked everywhere, found nothing") ----------
+
+function getNegativeCache(mediaId, artType) {
+  return db.prepare(`SELECT * FROM negative_cache WHERE media_id = ? AND art_type = ?`).get(mediaId, artType);
+}
+
+function setNegativeCache(mediaId, artType) {
+  db.prepare(
+    `INSERT INTO negative_cache (media_id, art_type, checked_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(media_id, art_type) DO UPDATE SET checked_at=CURRENT_TIMESTAMP`
+  ).run(mediaId, artType);
+}
+
+function clearNegativeCache(mediaId, artType) {
+  db.prepare(`DELETE FROM negative_cache WHERE media_id = ? AND art_type = ?`).run(mediaId, artType);
 }
 
 // ---------- request log ----------
@@ -238,6 +286,10 @@ module.exports = {
   deleteArt,
   getTpdbMatch,
   setTpdbMatch,
+  setTpdbError,
+  getNegativeCache,
+  setNegativeCache,
+  clearNegativeCache,
   logRequest,
   recentRequestCounts,
 };

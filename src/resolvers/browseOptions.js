@@ -10,9 +10,9 @@ const tpdb = require('../providers/theposterdb');
 const metahub = require('../providers/metahub');
 const { buildContext } = require('./resolveArt');
 
-/** Walks every candidate set on ThePosterDB for this title (up to the configured cap) and opens
- *  each one's detail page, so the admin can see language/variation for all of them side by side -
- *  not just the first English+Original hit the live resolver would have stopped at. */
+/** Evaluates every candidate set on ThePosterDB for this title IN PARALLEL (same helper the live
+ *  resolver uses), so the admin can see language/variation for all of them side by side - not
+ *  just the first English+Original hit the live resolver would have stopped at. */
 async function listTpdbCandidates(ctx, mediaRow) {
   const title = ctx.title || mediaRow.title;
   const year = ctx.year || mediaRow.year;
@@ -23,34 +23,26 @@ async function listTpdbCandidates(ctx, mediaRow) {
 
   const setIds = await tpdb.getCandidateSets(postersPageId, Math.max(config.tpdbMaxCandidates, 12)).catch(() => []);
 
-  const candidates = await Promise.all(
-    setIds.map(async (setId) => {
-      try {
-        const setPosters = await tpdb.getSetPosters(setId);
-        const target =
-          ctx.type === 'series'
-            ? setPosters.find((p) => /show/i.test(p.mediaTypeLabel) && tpdb.parseShowCaption(p.caption) === 'Cover') ||
-              setPosters.find((p) => /show/i.test(p.mediaTypeLabel))
-            : setPosters.find((p) => /movie/i.test(p.mediaTypeLabel)) || setPosters[0];
-        if (!target) return null;
-        const meta = await tpdb.getPosterMeta(target.assetId);
-        return {
-          source: 'theposterdb',
-          id: target.assetId,
-          setId,
-          imageUrl: tpdb.assetImageUrl(target.assetId),
-          language: meta?.language || null,
-          variation: meta?.variation || null,
-          label: [meta?.language, meta?.variation].filter(Boolean).join(' / ') || `set ${setId}`,
-        };
-      } catch (e) {
+  const evaluations = await Promise.all(
+    setIds.map((setId) =>
+      tpdb.evaluateCandidateSet(setId, { mediaType: ctx.type }).catch((e) => {
         logger.debug(`TPDB browse candidate set ${setId} failed:`, e.message);
         return null;
-      }
-    })
+      })
+    )
   );
 
-  return candidates.filter(Boolean);
+  return evaluations
+    .filter(Boolean)
+    .map((r) => ({
+      source: 'theposterdb',
+      id: r.assetId,
+      setId: r.setId,
+      imageUrl: r.imageUrl,
+      language: r.language,
+      variation: r.variation,
+      label: [r.language, r.variation].filter(Boolean).join(' / ') || `set ${r.setId}`,
+    }));
 }
 
 /** Returns a flat browsing payload: { poster: [...], backdrop: [...], logo: [...] } */

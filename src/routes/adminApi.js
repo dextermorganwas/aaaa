@@ -27,11 +27,13 @@ function serializeMedia(row) {
       artType: a.art_type,
       source: a.source,
       language: a.language,
+      reason: a.reason,
       isOverride: !!a.is_override,
       cacheForever: !!a.cache_forever,
       fetchedAt: a.fetched_at,
       expiresAt: a.expires_at,
-      url: `/admin/art-file/${row.id}/${a.art_type}`,
+      // NOTE: mounted at /api/admin in server.js - keep this in sync with that mount point.
+      url: `/api/admin/art-file/${row.id}/${a.art_type}`,
     })),
   };
 }
@@ -86,6 +88,8 @@ router.post('/media/:id/override', async (req, res) => {
   try {
     const dl = await fetchBuffer(imageUrl, { timeoutMs: 15000 });
     if (!dl) return res.status(502).json({ error: 'Could not download that image URL' });
+
+    const previous = db.getArt(row.id, artType);
     const localPath = cache.save({ mediaId: row.id, artType, source: source || 'manual', buffer: dl.buffer, contentType: dl.contentType, sourceUrl: imageUrl });
     const saved = db.upsertArt(row.id, artType, {
       source: source || 'manual',
@@ -94,10 +98,16 @@ router.post('/media/:id/override', async (req, res) => {
       localPath,
       contentType: dl.contentType,
       language: null,
+      reason: 'Manually selected in the admin dashboard',
       isOverride: true,
       cacheForever: true,
       expiresAt: null,
     });
+    // Clean up the file the previous pick pointed at, now that it's been fully replaced.
+    if (previous && previous.local_path && previous.local_path !== localPath) {
+      cache.remove(previous.local_path);
+    }
+    db.clearNegativeCache(row.id, artType);
     res.json({ ok: true, art: saved });
   } catch (e) {
     logger.error('override failed', e);
@@ -110,9 +120,10 @@ router.post('/media/:id/reresolve', async (req, res) => {
   if (!row) return res.status(404).json({ error: 'Not found' });
   const { artType } = req.body || {};
   if (!['poster', 'backdrop', 'logo'].includes(artType)) return res.status(400).json({ error: 'artType is required' });
-  db.deleteArt(row.id, artType);
   try {
-    const result = await resolver.resolve({ type: row.type, tmdbId: row.tmdb_id, imdbId: row.imdb_id, tvdbId: row.tvdb_id, artType });
+    // forceRefresh re-runs the chain without discarding the existing row first, so if the fresh
+    // attempt fails/finds nothing the item keeps its previous art instead of going blank.
+    const result = await resolver.resolve({ type: row.type, tmdbId: row.tmdb_id, imdbId: row.imdb_id, tvdbId: row.tvdb_id, artType, forceRefresh: true });
     res.json({ ok: true, art: result });
   } catch (e) {
     logger.error('reresolve failed', e);
@@ -123,7 +134,9 @@ router.post('/media/:id/reresolve', async (req, res) => {
 router.delete('/media/:id/art/:artType', (req, res) => {
   const row = db.getMediaById(Number(req.params.id));
   if (!row) return res.status(404).json({ error: 'Not found' });
+  const existing = db.getArt(row.id, req.params.artType);
   db.deleteArt(row.id, req.params.artType);
+  if (existing && existing.local_path) cache.remove(existing.local_path);
   res.json({ ok: true });
 });
 

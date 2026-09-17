@@ -1,12 +1,14 @@
 'use strict';
 // ThePosterDB has no official API. This scrapes the public site the same way community tools
-// (plex-theposterdb, artwork-uploader-plex) do. Because TPDB's markup can change without notice,
-// every parsing step here is defensive: if a selector finds nothing, we fall back to a regex pass
-// over the raw HTML before giving up. If TPDB visibly changes its layout, this is the file to fix.
+// (plex-theposterdb, artwork-uploader-plex) do. The set-grid selectors below mirror the working
+// Python/BeautifulSoup implementation in artwork-uploader-plex's theposterdb_scraper.py exactly
+// (outer card -> .overlay[data-poster-id] -> caption <p>), since that's a currently-maintained
+// scraper verified against production TPDB. Every step also has a regex fallback in case TPDB's
+// markup shifts; if it does, this is the file to fix.
 const cheerio = require('cheerio');
 const config = require('../config');
 const logger = require('../logger');
-const { fetchText, fetchBuffer } = require('../lib/httpClient');
+const { fetchText, fetchBuffer, limitedFetch } = require('../lib/httpClient');
 
 const BASE = 'https://theposterdb.com';
 
@@ -45,7 +47,6 @@ async function findPostersPageId({ title, year, mediaType }) {
   });
 
   if (!candidates.length) {
-    // Regex fallback in case the search results markup doesn't use plain <a> the way we expect.
     const re = /<a[^>]+href="((?:https:\/\/theposterdb\.com)?\/posters\/(\d+))"[^>]*>(.*?)<\/a>/gis;
     let m;
     while ((m = re.exec(html))) {
@@ -54,7 +55,6 @@ async function findPostersPageId({ title, year, mediaType }) {
     }
   }
 
-  // Prefer an exact title+year match; else exact title match; else first candidate containing the title.
   const yearMatch = candidates.find((c) => normalizeTitle(c.text.split('(')[0]) === wantTitle && c.text.includes(String(year || '####')));
   if (yearMatch) return yearMatch.id;
   const titleMatch = candidates.find((c) => normalizeTitle(c.text.split('(')[0]) === wantTitle);
@@ -76,8 +76,7 @@ async function getCandidateSets(postersPageId, maxCandidates) {
     if (sets.length >= maxCandidates) return;
     const href = $(el).attr('href') || '';
     const m = href.match(/\/set\/(\d+)/);
-    if (!m) return;
-    if (seen.has(m[1])) return;
+    if (!m || seen.has(m[1])) return;
     seen.add(m[1]);
     sets.push(m[1]);
   });
@@ -98,6 +97,7 @@ async function getCandidateSets(postersPageId, maxCandidates) {
 
 function parseShowCaption(caption) {
   // "Show Name (2016)" -> cover; "Show Name (2016) - Season 2" -> season 2; "- Specials" -> season 0
+  if (!caption) return 'Cover';
   let season = 'Cover';
   const parts = caption.split(' - ');
   if (parts.length > 1) {
@@ -111,83 +111,113 @@ function parseShowCaption(caption) {
   return season;
 }
 
-/** Step 3: scrape one /set/{id} page for its poster grid (mirrors ThePosterDBScraper.get_posters). */
+/** Step 3: scrape one /set/{id} page for its poster grid. Mirrors the Python scraper's exact
+ *  traversal: outer card (.col-6.col-lg-2.p-1) -> .overlay[data-poster-id] -> caption <p>. */
 async function getSetPosters(setId) {
   const html = await get(`/set/${setId}`);
   if (!html) return [];
   const $ = cheerio.load(html);
   const posters = [];
 
-  $('div.overlay[data-poster-id]').each((_, el) => {
-    const $el = $(el);
-    const posterId = $el.attr('data-poster-id');
-    const card = $el.closest('.col-6, [class*="col-lg-2"]').length ? $el.closest('.col-6, [class*="col-lg-2"]') : $el.parent().parent();
-    const mediaTypeLabel = card.find('a[data-toggle="tooltip"]').attr('title') || card.find('a.text-white').attr('title') || '';
-    const captionRaw = card.find('p.p-0.mb-1.text-break, p.text-break').first().text().trim();
+  $('div.col-6.col-lg-2.p-1').each((_, el) => {
+    const card = $(el);
+    const posterId = card.find('div.overlay').attr('data-poster-id');
     if (!posterId) return;
+    const mediaTypeLabel = card.find('a[data-toggle="tooltip"][data-placement="top"]').attr('title') || '';
+    const captionRaw = card.find('p.p-0.mb-1.text-break').first().text().trim();
     posters.push({ assetId: posterId, mediaTypeLabel: mediaTypeLabel.trim(), caption: captionRaw });
   });
 
   if (!posters.length) {
-    // Regex fallback keyed off the data-poster-id attribute alone.
+    // Regex fallback keyed off the data-poster-id attribute alone - loses caption/type info,
+    // but the individual /poster/{id} detail page (fetched next) carries its own caption too,
+    // so evaluateCandidateSet() can still make a correct decision even from this bare list.
     const re = /data-poster-id=["'](\d+)["']/g;
+    const seen = new Set();
     let m;
-    while ((m = re.exec(html))) posters.push({ assetId: m[1], mediaTypeLabel: '', caption: '' });
+    while ((m = re.exec(html))) {
+      if (seen.has(m[1])) continue;
+      seen.add(m[1]);
+      posters.push({ assetId: m[1], mediaTypeLabel: '', caption: '' });
+    }
   }
 
   return posters;
 }
 
-/** Step 4: open an individual /poster/{assetId} page to read Language / Type / Variation. */
+/** Step 4: open an individual /poster/{assetId} page to read Language / Type / Variation, and
+ *  the poster's own caption (e.g. "Breaking Bad (2008) - Season 2") which is authoritative for
+ *  season/cover detection regardless of whether the set-grid caption parsed cleanly. */
 async function getPosterMeta(assetId) {
   const html = await get(`/poster/${assetId}`);
   if (!html) return null;
   const text = html.replace(/<[^>]+>/g, ' ').replace(/&middot;|·/g, '|').replace(/\s+/g, ' ');
-  const m = text.match(/Language:\s*([A-Za-z\- ]+?)\s*\|\s*Type:\s*([A-Za-z\- ]+?)\s*\|\s*Variation:\s*([A-Za-z' \-]+?)\s*(?:\||Notes|$)/i);
-  if (!m) return null;
-  return { language: m[1].trim(), type: m[2].trim(), variation: m[3].trim() };
+
+  const metaMatch = text.match(
+    /Language:\s*([A-Za-z\- ]+?)\s*\|\s*Type:\s*([A-Za-z\- ]+?)\s*\|\s*Variation:\s*([A-Za-z' \-]+?)\s*(?:\||Notes|$)/i
+  );
+  if (!metaMatch) return null;
+
+  // Caption sits immediately before "by <uploader> ... Uploaded:" - bounded lookback keeps this
+  // from accidentally matching something in the page's nav/header text further back.
+  const captionMatch = text.match(/([^|]{1,100}?)\s+by\s+[^|]{1,60}?\|\s*Uploaded:/i);
+
+  return {
+    language: metaMatch[1].trim(),
+    type: metaMatch[2].trim(),
+    variation: metaMatch[3].trim(),
+    caption: captionMatch ? captionMatch[1].trim() : null,
+  };
+}
+
+/** Picks which poster within a set to evaluate, then fetches its detail page and validates it
+ *  against the required criteria using the DETAIL PAGE's own caption as the final word on
+ *  season/cover status (not just the grid's, which may be blank if selectors ever miss). */
+async function evaluateCandidateSet(setId, { mediaType }) {
+  const setPosters = await getSetPosters(setId);
+  if (!setPosters.length) return null;
+
+  const wantLabel = mediaType === 'series' ? /show/i : /movie/i;
+  const target =
+    setPosters.find((p) => wantLabel.test(p.mediaTypeLabel) && (mediaType !== 'series' || parseShowCaption(p.caption) === 'Cover')) ||
+    setPosters.find((p) => wantLabel.test(p.mediaTypeLabel)) ||
+    setPosters[0];
+  if (!target) return null;
+
+  const meta = await getPosterMeta(target.assetId);
+  if (!meta) return null;
+
+  const expectedType = mediaType === 'series' ? 'show' : 'movie';
+  if (!new RegExp(expectedType, 'i').test(meta.type)) return null;
+  if (mediaType === 'series' && parseShowCaption(meta.caption) !== 'Cover') return null;
+
+  return { setId, assetId: target.assetId, imageUrl: assetImageUrl(target.assetId), ...meta };
 }
 
 /**
- * The full chain: search -> disambiguation page -> walk candidate sets in order -> for each,
- * find the relevant poster within the set (movie poster, or show-cover for series) -> open its
- * detail page and accept the first one that is English + Original (+ Show Cover for series).
- * Returns { assetId, imageUrl, language, variation } or null.
+ * The full chain: search -> disambiguation page -> evaluate every candidate set IN PARALLEL
+ * (each set still needs its own two sequential requests, but different sets no longer wait on
+ * each other) -> return the first, in the site's original order, that is English + Original
+ * (+ Show Cover for series). Returns { postersPageId, result } where result is null if nothing
+ * qualified.
  */
 async function findEnglishOriginalPoster({ title, year, mediaType }) {
   const postersPageId = await findPostersPageId({ title, year, mediaType });
   if (!postersPageId) return { postersPageId: null, result: null };
 
   const setIds = await getCandidateSets(postersPageId, config.tpdbMaxCandidates);
-  for (const setId of setIds) {
-    let setPosters;
-    try {
-      setPosters = await getSetPosters(setId);
-    } catch (e) {
-      logger.debug(`TPDB set ${setId} fetch failed:`, e.message);
-      continue;
-    }
-    // Within a set, find the specific poster we care about.
-    const target =
-      mediaType === 'series'
-        ? setPosters.find((p) => /show/i.test(p.mediaTypeLabel) && parseShowCaption(p.caption) === 'Cover') ||
-          setPosters.find((p) => /show/i.test(p.mediaTypeLabel))
-        : setPosters.find((p) => /movie/i.test(p.mediaTypeLabel)) || setPosters[0];
-    if (!target) continue;
+  const evaluations = await Promise.all(
+    setIds.map((setId) =>
+      evaluateCandidateSet(setId, { mediaType }).catch((e) => {
+        logger.debug(`TPDB candidate set ${setId} evaluation failed:`, e.message);
+        return null;
+      })
+    )
+  );
 
-    let meta;
-    try {
-      meta = await getPosterMeta(target.assetId);
-    } catch (e) {
-      logger.debug(`TPDB poster ${target.assetId} meta fetch failed:`, e.message);
-      continue;
-    }
-    if (!meta) continue;
-    if (/^english$/i.test(meta.language) && /^original$/i.test(meta.variation)) {
-      return {
-        postersPageId,
-        result: { assetId: target.assetId, imageUrl: assetImageUrl(target.assetId), ...meta },
-      };
+  for (const evalResult of evaluations) {
+    if (evalResult && /^english$/i.test(evalResult.language) && /^original$/i.test(evalResult.variation)) {
+      return { postersPageId, result: evalResult };
     }
   }
   return { postersPageId, result: null };
@@ -204,11 +234,10 @@ module.exports = {
   findEnglishOriginalPoster,
   downloadPoster,
   assetImageUrl,
-  // Exported for the admin "browse everything" view, which needs to walk every candidate
-  // rather than stopping at the first English+Original match.
   findPostersPageId,
   getCandidateSets,
   getSetPosters,
   getPosterMeta,
+  evaluateCandidateSet,
   parseShowCaption,
 };

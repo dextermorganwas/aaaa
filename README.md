@@ -17,10 +17,12 @@ ThePosterDB results are cached **forever**. Everything else is cached for a conf
 of days and re-checked afterwards. All resolved art is downloaded once and served from local
 disk, not re-fetched from upstream on every request.
 
-If ThePosterDB is slow to respond, the current request is **not** blocked on it — it falls
-through to the rest of the chain immediately, while the ThePosterDB lookup keeps running in the
-background. If it later finds a match, it silently upgrades the cached art so the *next* request
-gets the ThePosterDB version.
+By default, no request ever waits on ThePosterDB — it's the slowest provider by a wide margin
+(it has no API, so each candidate requires opening a couple of its actual web pages), so every
+request falls straight through to TMDB/TVDB/Metahub while ThePosterDB is checked in the
+background. If it finds a qualifying poster, it silently upgrades the cache so the *next*
+request gets the ThePosterDB version. (You can opt into waiting on the first request instead via
+`TPDB_INLINE_ENABLED=true` - see `.env.example`.)
 
 A small admin dashboard (at `/admin`) lists every item that's ever been requested, shows what
 art is currently being served for it, and lets you browse everything each provider has and
@@ -87,6 +89,40 @@ Set `ADMIN_USER`/`ADMIN_PASSWORD` in `.env` to put HTTP Basic Auth in front of `
 box is reachable from the internet.
 
 ---
+
+## Upgrading an existing deployment
+
+This update changes the database schema (adds a `reason` column and a couple of new tables) and
+rewrites the ThePosterDB scraper to evaluate candidates in parallel instead of one at a time
+(this was the main cause of it feeling slow). The app migrates your existing `./data/db` in
+place automatically on startup - no manual steps needed, just pull the new image and restart:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+**Behavior changes worth knowing about:**
+
+- **ThePosterDB is now skipped inline by default** (`TPDB_INLINE_ENABLED=false`). Every request
+  gets an immediate answer from TMDB/TVDB/Metahub while ThePosterDB is checked in the background;
+  if it finds a qualifying poster, it silently upgrades the cache for next time. Set
+  `TPDB_INLINE_ENABLED=true` if you'd rather the *first* request for an item wait up to
+  `TPDB_TIMEOUT_MS` for ThePosterDB before falling through.
+- **ThePosterDB candidate sets are now evaluated in parallel**, not one at a time - this is the
+  actual fix for the slowness; the old sequential loop could take 10-20+ round trips in series
+  for a single title.
+- Confirmed "ThePosterDB has nothing" results are now remembered for `TPDB_NEGATIVE_CACHE_DAYS`
+  (default 3) instead of forever, and provider errors/timeouts back off for
+  `TPDB_ERROR_BACKOFF_MINUTES` (default 20) instead of being retried on every single request.
+- A general negative cache (`NEGATIVE_CACHE_TTL_HOURS`, default 12) now covers "nothing was found
+  anywhere for this item" so a bad/mismatched id doesn't hit every provider on every request.
+- Replacing an item's art (auto re-resolution, an admin override, or a background ThePosterDB
+  upgrade) now deletes the old cached file instead of leaving it orphaned on disk.
+- The admin dashboard's "Re-run chain" button no longer clears the existing art before trying
+  again - if the fresh attempt fails, the item keeps showing its previous art instead of going
+  blank.
+- Each resolved art entry now records *why* it was picked (which chain step matched), shown as
+  "Why:" in the admin dashboard.
 
 ## Troubleshooting
 

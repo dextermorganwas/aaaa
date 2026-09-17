@@ -14,6 +14,8 @@ const tpdb = require('../providers/theposterdb');
 const metahub = require('../providers/metahub');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
 
 function ttlForSource(source) {
   if (source === 'theposterdb') return null; // cache forever
@@ -31,20 +33,31 @@ function isExpired(artRow) {
   return Date.now() > new Date(artRow.expires_at).getTime();
 }
 
-async function persistArt({ mediaId, artType, source, sourceRef, sourceUrl, buffer, contentType, language }) {
+/** Saves the new file, upserts the DB row, and - critically - deletes whatever file the
+ *  PREVIOUS art row for this media+type pointed at (if any, and if different), so replacing a
+ *  poster (auto re-resolution, an admin override, or a background TPDB upgrade) doesn't leave
+ *  the old image orphaned on disk forever. */
+async function persistArt({ mediaId, artType, source, sourceRef, sourceUrl, buffer, contentType, language, reason }) {
+  const previous = db.getArt(mediaId, artType);
   const localPath = cache.save({ mediaId, artType, source, buffer, contentType, sourceUrl });
   const ttl = ttlForSource(source);
-  return db.upsertArt(mediaId, artType, {
+  const saved = db.upsertArt(mediaId, artType, {
     source,
     sourceRef,
     sourceUrl,
     localPath,
     contentType,
     language,
+    reason,
     isOverride: false,
     cacheForever: source === 'theposterdb',
     expiresAt: ttl ? new Date(Date.now() + ttl).toISOString() : null,
   });
+  if (previous && previous.local_path && previous.local_path !== localPath) {
+    cache.remove(previous.local_path);
+  }
+  db.clearNegativeCache(mediaId, artType);
+  return saved;
 }
 
 /** Gathers just enough cross-provider context (ids, original language, primary TMDB payload)
@@ -90,15 +103,34 @@ async function getTvdbData(ctx) {
 
 // ---------------- POSTER ----------------
 
+function tpdbIsOnCooldown(mediaId) {
+  const cached = db.getTpdbMatch(mediaId);
+  if (!cached) return false;
+  if (cached.not_found && cached.updated_at) {
+    const age = Date.now() - new Date(cached.updated_at).getTime();
+    if (age < config.tpdbNegativeCacheDays * DAY_MS) return true;
+  }
+  if (cached.last_error_at) {
+    const age = Date.now() - new Date(cached.last_error_at).getTime();
+    if (age < config.tpdbErrorBackoffMinutes * MINUTE_MS) return true;
+  }
+  return false;
+}
+
 async function resolvePosterViaTpdb(mediaRow, ctx) {
   const title = ctx.title || mediaRow.title;
   const year = ctx.year || mediaRow.year;
   if (!title) return null;
+  if (tpdbIsOnCooldown(mediaRow.id)) return null;
 
-  const cachedMatch = db.getTpdbMatch(mediaRow.id);
-  if (cachedMatch && cachedMatch.not_found) return null;
-
-  const { postersPageId, result } = await tpdb.findEnglishOriginalPoster({ title, year, mediaType: ctx.type });
+  let outcome;
+  try {
+    outcome = await tpdb.findEnglishOriginalPoster({ title, year, mediaType: ctx.type });
+  } catch (e) {
+    db.setTpdbError(mediaRow.id);
+    throw e;
+  }
+  const { postersPageId, result } = outcome;
   db.setTpdbMatch(mediaRow.id, postersPageId, !result);
   if (!result) return null;
 
@@ -111,59 +143,53 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
     buffer: dl.buffer,
     contentType: dl.contentType,
     language: result.language,
+    reason: `ThePosterDB: English, Original variation${ctx.type === 'series' ? ', Show Cover' : ''} (set ${result.setId})`,
   };
 }
 
 async function resolvePosterRestOfChain(mediaRow, ctx) {
-  // TMDB English
   if (ctx.tmdbImages) {
     const img = tmdb.pickFirst(ctx.tmdbImages, 'posters', 'en');
     if (img) {
       const dl = await tmdb.downloadImage(img.file_path, config.tmdbPosterSize);
-      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'en' };
+      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'en', reason: 'TMDB: first English poster' };
     }
   }
-  // TVDB English
   const tvdbData = await getTvdbData(ctx);
   if (tvdbData) {
     const art = tvdb.pickFirst(tvdbData.posters, 'eng');
     if (art) {
       const dl = await tvdb.downloadImage(art.image);
-      if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'eng' };
+      if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'eng', reason: 'TVDB: first English poster' };
     }
   }
-  // TMDB original language
   if (ctx.originalLanguage && ctx.originalLanguage !== 'en') {
     const langImages = await tmdbOriginalLanguageImages(ctx);
     const img = tmdb.pickFirst(langImages, 'posters', ctx.originalLanguage);
     if (img) {
       const dl = await tmdb.downloadImage(img.file_path, config.tmdbPosterSize);
-      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: ctx.originalLanguage };
+      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: ctx.originalLanguage, reason: `TMDB: first poster in original language (${ctx.originalLanguage})` };
     }
-    // TVDB in that same original language
     if (tvdbData) {
       const tvdbLang = langMap.toTvdbLang(ctx.originalLanguage);
       const art = tvdb.pickFirst(tvdbData.posters, tvdbLang);
       if (art) {
         const dl = await tvdb.downloadImage(art.image);
-        if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: tvdbLang };
+        if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: tvdbLang, reason: `TVDB: first poster in original language (${tvdbLang})` };
       }
     }
   }
-  // Metahub
   if (ctx.imdbId) {
     const dl = await metahub.download('poster', ctx.imdbId);
-    if (dl) return { source: 'metahub', sourceRef: ctx.imdbId, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'metahub', sourceRef: ctx.imdbId, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'Metahub fallback (last resort before primary)' };
   }
-  // TMDB primary poster (whatever TMDB considers the main one)
   if (ctx.tmdbDetails?.poster_path) {
     const dl = await tmdb.downloadImage(ctx.tmdbDetails.poster_path, config.tmdbPosterSize);
-    if (dl) return { source: 'tmdb', sourceRef: ctx.tmdbDetails.poster_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'tmdb', sourceRef: ctx.tmdbDetails.poster_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: "TMDB: primary poster (nothing else matched)" };
   }
-  // TVDB primary image
   if (tvdbData?.primaryImage) {
     const dl = await tvdb.downloadImage(tvdbData.primaryImage);
-    if (dl) return { source: 'tvdb', sourceRef: 'primary', sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'tvdb', sourceRef: 'primary', sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: "TVDB: primary image (nothing else matched)" };
   }
   return null;
 }
@@ -173,24 +199,35 @@ async function resolvePoster(mediaRow, ctx) {
     logger.debug('TPDB poster resolution errored:', e.message);
     return null;
   });
-  const raced = await raceWithBackground(tpdbPromise, config.tpdbTimeoutMs);
 
-  if (!raced.timedOut && raced.value) return raced.value;
-
-  if (raced.timedOut) {
-    logger.info(`ThePosterDB is taking a while for media #${mediaRow.id} - continuing without it, will backfill in background`);
+  function scheduleBackfill() {
     background.schedule(`tpdb-backfill-${mediaRow.id}`, async () => {
       const result = await tpdbPromise;
-      if (!result) return;
+      if (!result) {
+        logger.info(`ThePosterDB backfill for media #${mediaRow.id}: no qualifying (English/Original${ctx.type === 'series' ? '/Show Cover' : ''}) poster found.`);
+        return;
+      }
       const current = db.getArt(mediaRow.id, 'poster');
-      // Don't clobber a manual override, and don't bother if we already have a TPDB result
-      // (e.g. two overlapping requests both triggered a backfill).
       if (current && (current.is_override || current.source === 'theposterdb')) return;
       await persistArt({ mediaId: mediaRow.id, artType: 'poster', ...result });
-      logger.info(`ThePosterDB backfill complete for media #${mediaRow.id} - future requests will use it`);
+      logger.info(`ThePosterDB backfill complete for media #${mediaRow.id} - future requests will use it.`);
     });
   }
 
+  if (!config.tpdbInlineEnabled) {
+    // Never block the response on TPDB at all - fire it off and move straight to the rest of
+    // the chain. This is the default, since ThePosterDB's per-candidate detail-page checks make
+    // it inherently the slowest provider by a wide margin.
+    scheduleBackfill();
+    return resolvePosterRestOfChain(mediaRow, ctx);
+  }
+
+  const raced = await raceWithBackground(tpdbPromise, config.tpdbTimeoutMs);
+  if (!raced.timedOut && raced.value) return raced.value;
+  if (raced.timedOut) {
+    logger.info(`ThePosterDB is taking a while for media #${mediaRow.id} - continuing without it, will backfill in background.`);
+    scheduleBackfill();
+  }
   return resolvePosterRestOfChain(mediaRow, ctx);
 }
 
@@ -201,7 +238,7 @@ async function resolveBackdrop(mediaRow, ctx) {
     const img = tmdb.pickFirst(ctx.tmdbImages, 'backdrops', null);
     if (img) {
       const dl = await tmdb.downloadImage(img.file_path, config.tmdbBackdropSize);
-      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'TMDB: first textless backdrop' };
     }
   }
   const tvdbData = await getTvdbData(ctx);
@@ -209,20 +246,20 @@ async function resolveBackdrop(mediaRow, ctx) {
     const art = tvdb.pickFirst(tvdbData.backgrounds, null);
     if (art) {
       const dl = await tvdb.downloadImage(art.image);
-      if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+      if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'TVDB: first textless background' };
     }
   }
   if (ctx.imdbId) {
     const dl = await metahub.download('backdrop', ctx.imdbId);
-    if (dl) return { source: 'metahub', sourceRef: ctx.imdbId, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'metahub', sourceRef: ctx.imdbId, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'Metahub fallback (last resort before primary)' };
   }
   if (ctx.tmdbDetails?.backdrop_path) {
     const dl = await tmdb.downloadImage(ctx.tmdbDetails.backdrop_path, config.tmdbBackdropSize);
-    if (dl) return { source: 'tmdb', sourceRef: ctx.tmdbDetails.backdrop_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'tmdb', sourceRef: ctx.tmdbDetails.backdrop_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'TMDB: primary backdrop (nothing textless matched)' };
   }
   if (tvdbData?.backgrounds?.[0]) {
     const dl = await tvdb.downloadImage(tvdbData.backgrounds[0].image);
-    if (dl) return { source: 'tvdb', sourceRef: tvdbData.backgrounds[0].id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'tvdb', sourceRef: tvdbData.backgrounds[0].id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'TVDB: first available background (nothing textless matched)' };
   }
   return null;
 }
@@ -234,7 +271,7 @@ async function resolveLogo(mediaRow, ctx) {
     const img = tmdb.pickFirst(ctx.tmdbImages, 'logos', 'en');
     if (img) {
       const dl = await tmdb.downloadImage(img.file_path, config.tmdbLogoSize);
-      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'en' };
+      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'en', reason: 'TMDB: first English logo' };
     }
   }
   const tvdbData = await getTvdbData(ctx);
@@ -242,7 +279,7 @@ async function resolveLogo(mediaRow, ctx) {
     const art = tvdb.pickFirst(tvdbData.logos, 'eng');
     if (art) {
       const dl = await tvdb.downloadImage(art.image);
-      if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'eng' };
+      if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: 'eng', reason: 'TVDB: first English logo' };
     }
   }
   if (ctx.originalLanguage && ctx.originalLanguage !== 'en') {
@@ -250,29 +287,29 @@ async function resolveLogo(mediaRow, ctx) {
     const img = tmdb.pickFirst(langImages, 'logos', ctx.originalLanguage);
     if (img) {
       const dl = await tmdb.downloadImage(img.file_path, config.tmdbLogoSize);
-      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: ctx.originalLanguage };
+      if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: ctx.originalLanguage, reason: `TMDB: first logo in original language (${ctx.originalLanguage})` };
     }
     if (tvdbData) {
       const tvdbLang = langMap.toTvdbLang(ctx.originalLanguage);
       const art = tvdb.pickFirst(tvdbData.logos, tvdbLang);
       if (art) {
         const dl = await tvdb.downloadImage(art.image);
-        if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: tvdbLang };
+        if (dl) return { source: 'tvdb', sourceRef: art.id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: tvdbLang, reason: `TVDB: first logo in original language (${tvdbLang})` };
       }
     }
   }
   if (ctx.imdbId) {
     const dl = await metahub.download('logo', ctx.imdbId);
-    if (dl) return { source: 'metahub', sourceRef: ctx.imdbId, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'metahub', sourceRef: ctx.imdbId, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'Metahub fallback (last resort before primary)' };
   }
   if (ctx.tmdbImages?.logos?.[0]) {
     const img = ctx.tmdbImages.logos[0];
     const dl = await tmdb.downloadImage(img.file_path, config.tmdbLogoSize);
-    if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'tmdb', sourceRef: img.file_path, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'TMDB: first available logo, any language (nothing else matched)' };
   }
   if (tvdbData?.logos?.[0]) {
     const dl = await tvdb.downloadImage(tvdbData.logos[0].image);
-    if (dl) return { source: 'tvdb', sourceRef: tvdbData.logos[0].id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null };
+    if (dl) return { source: 'tvdb', sourceRef: tvdbData.logos[0].id, sourceUrl: dl.sourceUrl, buffer: dl.buffer, contentType: dl.contentType, language: null, reason: 'TVDB: first available logo, any language (nothing else matched)' };
   }
   return null;
 }
@@ -280,18 +317,34 @@ async function resolveLogo(mediaRow, ctx) {
 const CHAINS = { poster: resolvePoster, backdrop: resolveBackdrop, logo: resolveLogo };
 
 /**
- * Main entry point. Returns { localPath, contentType, source } ready to stream, or null if
- * absolutely nothing could be found anywhere (caller decides whether to serve a placeholder).
+ * Main entry point. Returns a raw `art` db row ready to stream, or null if nothing could be
+ * found anywhere (caller decides whether to serve a placeholder).
+ *
+ * forceRefresh: bypasses the "already have fresh cached art" short-circuit (used by the admin
+ * "re-run chain" button) WITHOUT discarding the existing row up front - if the fresh attempt
+ * comes back empty, the old art keeps serving rather than the item going blank.
  */
-async function resolve({ type, tmdbId, imdbId, tvdbId, artType }) {
+async function resolve({ type, tmdbId, imdbId, tvdbId, artType, forceRefresh = false }) {
   const mediaRow = db.findOrCreateMedia({ type, tmdbId, imdbId, tvdbId });
   db.logRequest(mediaRow.id, artType);
 
   const key = `${mediaRow.id}:${artType}`;
   return singleflight.run(key, async () => {
     const existing = db.getArt(mediaRow.id, artType);
-    if (existing && !isExpired(existing) && cache.exists(existing.local_path)) {
+    if (!forceRefresh && existing && !isExpired(existing) && cache.exists(existing.local_path)) {
       return existing;
+    }
+
+    if (!forceRefresh) {
+      const negative = db.getNegativeCache(mediaRow.id, artType);
+      if (negative) {
+        const age = Date.now() - new Date(negative.checked_at).getTime();
+        if (age < config.negativeCacheTtlHours * HOUR_MS) {
+          // Confirmed recently that nothing is available anywhere - don't hit every provider
+          // again on every request; serve stale art if we happen to have any, else nothing.
+          return existing && cache.exists(existing.local_path) ? existing : null;
+        }
+      }
     }
 
     const ctx = await buildContext({ type, tmdbId: mediaRow.tmdb_id, imdbId: mediaRow.imdb_id, tvdbId: mediaRow.tvdb_id });
@@ -306,8 +359,8 @@ async function resolve({ type, tmdbId, imdbId, tvdbId, artType }) {
     }
 
     if (!result) {
-      // Serve a stale cached copy rather than nothing, if one still exists on disk.
-      if (existing && cache.exists(existing.local_path)) return existing;
+      db.setNegativeCache(mediaRow.id, artType);
+      if (existing && cache.exists(existing.local_path)) return existing; // keep serving stale art
       return null;
     }
 

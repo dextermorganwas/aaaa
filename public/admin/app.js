@@ -107,6 +107,7 @@ function artSectionHtml(media, artType) {
         <div class="current-meta">
           ${a ? `
             <div><span class="label">Source:</span> ${a.source}${a.isOverride ? ' (manual override)' : ''}</div>
+            <div><span class="label">Why:</span> ${escapeHtml(a.reason || '—')}</div>
             <div><span class="label">Language:</span> ${a.language || '—'}</div>
             <div><span class="label">Cached:</span> ${a.cacheForever ? 'forever' : a.expiresAt ? `until ${new Date(a.expiresAt).toLocaleString()}` : '—'}</div>
             <div><span class="label">Fetched:</span> ${new Date(a.fetchedAt).toLocaleString()}</div>

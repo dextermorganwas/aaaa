@@ -42,7 +42,16 @@ module.exports = {
   cacheTtlDaysTmdb: int(process.env.CACHE_TTL_DAYS_TMDB, 30),
   cacheTtlDaysTvdb: int(process.env.CACHE_TTL_DAYS_TVDB, 30),
   cacheTtlDaysMetahub: int(process.env.CACHE_TTL_DAYS_METAHUB, 14),
+  // How long a confirmed "nothing found anywhere" result is remembered before trying again -
+  // avoids re-querying every provider on every single request for a bad/unmatched id.
   negativeCacheTtlHours: int(process.env.NEGATIVE_CACHE_TTL_HOURS, 12),
+  // How long a confirmed "ThePosterDB has no qualifying English+Original poster for this title"
+  // result is remembered before trying again. Longer than the general negative cache above,
+  // since TPDB's catalog grows slowly - no need to re-crawl it every few hours.
+  tpdbNegativeCacheDays: int(process.env.TPDB_NEGATIVE_CACHE_DAYS, 3),
+  // How long to back off ThePosterDB after it errors/times out (distinct from a clean "not
+  // found" - this is "something went wrong", so retried sooner).
+  tpdbErrorBackoffMinutes: int(process.env.TPDB_ERROR_BACKOFF_MINUTES, 20),
 
   // --- Concurrency / resource usage ---
   // Global cap on simultaneous outbound provider fetches (across all requests).
@@ -55,6 +64,13 @@ module.exports = {
   tmdbTimeoutMs: int(process.env.TMDB_TIMEOUT_MS, 6000),
   tvdbTimeoutMs: int(process.env.TVDB_TIMEOUT_MS, 6000),
   metahubTimeoutMs: int(process.env.METAHUB_TIMEOUT_MS, 5000),
+
+  // If false (the default), a request never waits on ThePosterDB at all - it's kicked off in the
+  // background immediately and the response falls straight through to TMDB/TVDB/Metahub. Set to
+  // true to have the *first* request for an item wait up to TPDB_TIMEOUT_MS for ThePosterDB
+  // before falling through (useful if you'd rather eat the latency once than serve a TMDB poster
+  // temporarily), with the same background-backfill behaviour either way once that wait expires.
+  tpdbInlineEnabled: bool(process.env.TPDB_INLINE_ENABLED, false),
 
   // How many candidate ThePosterDB sets to actually open (each costs one request) before
   // giving up on a title. Keep this modest - it directly controls TPDB load & latency.

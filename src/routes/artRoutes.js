@@ -69,7 +69,7 @@ async function handle(artType, req, res) {
 function respondFallback(artType, res, status) {
   const placeholder = PLACEHOLDERS[artType];
   if (config.servePlaceholderOn404 && placeholder) {
-    res.set('Cache-Control', 'public, max-age=3600');
+    res.set('Cache-Control', `public, max-age=${config.negativeCacheTtlHours * 3600}`);
     return res.redirect(302, placeholder);
   }
   return res.status(status).json({ error: status === 400 ? 'Could not parse a usable id from the request' : 'No artwork found' });
