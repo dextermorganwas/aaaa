@@ -121,7 +121,6 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
   const title = ctx.title || mediaRow.title;
   const year = ctx.year || mediaRow.year;
   if (!title) return null;
-  if (tpdbIsOnCooldown(mediaRow.id)) return null;
 
   let outcome;
   try {
@@ -201,6 +200,15 @@ async function resolvePosterRestOfChain(mediaRow, ctx) {
 }
 
 async function resolvePoster(mediaRow, ctx) {
+  if (tpdbIsOnCooldown(mediaRow.id)) {
+    // A previous attempt already recorded a confirmed "not found" or an error, and it hasn't
+    // expired yet - skip entirely rather than logging a misleading "no qualifying poster found"
+    // for what's actually just an unexpired cooldown (that message is reserved for a check that
+    // genuinely just ran and found nothing).
+    logger.debug(`ThePosterDB on cooldown for media #${mediaRow.id}, skipping this cycle.`);
+    return resolvePosterRestOfChain(mediaRow, ctx);
+  }
+
   const tpdbPromise = resolvePosterViaTpdb(mediaRow, ctx).catch((e) => {
     logger.debug('TPDB poster resolution errored:', e.message);
     return null;

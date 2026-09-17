@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS request_log (
   requested_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_request_log_media ON request_log(media_id);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 `);
 
 // Safe migrations for databases created by earlier versions of this app, which won't have the
@@ -85,6 +90,24 @@ function safeAddColumn(table, columnDef) {
 safeAddColumn('art', 'reason TEXT');
 safeAddColumn('tpdb_match_cache', 'last_error_at TEXT');
 safeAddColumn('tpdb_match_cache', 'last_reason TEXT');
+
+// Every time the ThePosterDB scraper's actual matching logic changes in a way that could flip a
+// previous "not found"/error verdict, bump TPDB_SCRAPER_VERSION in theposterdb.js. On startup,
+// if the stored version is older, every remembered TPDB verdict is wiped so items get an honest
+// fresh check instead of being stuck respecting a cooldown recorded by the old, buggy logic -
+// this exact confusion ("browse finds it, the live chain won't try again for days") has bitten
+// this app more than once across scraper fixes, so it's now handled automatically rather than
+// relying on someone remembering to run "Re-run chain" by hand after every update.
+const { TPDB_SCRAPER_VERSION } = require('./providers/theposterdb');
+const storedVersion = db.prepare(`SELECT value FROM app_meta WHERE key = 'tpdb_scraper_version'`).get();
+if (!storedVersion || storedVersion.value !== String(TPDB_SCRAPER_VERSION)) {
+  const cleared = db.prepare(`DELETE FROM tpdb_match_cache`).run().changes;
+  db.prepare(`INSERT INTO app_meta (key, value) VALUES ('tpdb_scraper_version', ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(TPDB_SCRAPER_VERSION));
+  if (cleared > 0) {
+    logger.info(`ThePosterDB scraper logic updated (v${TPDB_SCRAPER_VERSION}) - cleared ${cleared} remembered verdict(s) so items get a fresh check instead of an old cooldown.`);
+  }
+}
 
 logger.info(`SQLite database ready at ${config.dbPath}`);
 

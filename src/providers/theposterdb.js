@@ -254,7 +254,15 @@ async function downloadPoster(assetId) {
   return { ...result, sourceUrl: url };
 }
 
+// Bump this whenever a change to the matching/parsing logic above could flip a previous
+// verdict (a "not found" that should now be found, or vice versa) - db.js uses it to
+// auto-invalidate remembered ThePosterDB verdicts on startup so old bugs don't linger as
+// cooldowns after they're fixed. Last bumped: fixed <script>/<style> content leaking into
+// text extraction, which was corrupting Language/Type/Variation parsing for some titles.
+const TPDB_SCRAPER_VERSION = 5;
+
 module.exports = {
+  TPDB_SCRAPER_VERSION,
   findEnglishOriginalPoster,
   downloadPoster,
   assetImageUrl,

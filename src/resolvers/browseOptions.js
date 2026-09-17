@@ -29,7 +29,7 @@ async function listTpdbCandidates(ctx, mediaRow) {
   const postersPageId = await tpdb.findPostersPageId({ title, year, mediaType: ctx.type }).catch(() => null);
   if (!postersPageId) return [];
 
-  const { candidates } = await tpdb.getCoverCandidates(postersPageId, Math.max(config.tpdbMaxCandidates, 12)).catch(() => ({ candidates: [] }));
+  const { candidates } = await tpdb.getCoverCandidates(postersPageId, config.tpdbMaxCandidates).catch(() => ({ candidates: [] }));
 
   const evaluations = await Promise.all(
     candidates.map((c) =>

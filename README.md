@@ -92,27 +92,37 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest fix:** cheerio's `.text()` includes `<script>`/`<style>` tag contents by default, and
-ThePosterDB is a Livewire/Alpine-heavy site with embedded JSON state blobs - these were
-occasionally containing text that looked enough like `Type:`/`Language:` labels to get matched
-instead of the real ones, corrupting the result for *some* titles but not others (which matched
-exactly what was reported: "browse shows it, live doesn't"). Script/style content is now stripped
-before extraction. Two smaller improvements alongside it:
-- ThePosterDB requests now go through their own concurrency limit (`TPDB_MAX_CONCURRENT`,
-  default 4) instead of sharing the general `MAX_CONCURRENT_FETCHES` pool with TMDB/TVDB, so
-  scraping load on ThePosterDB specifically is easy to tune independently.
-- When a title doesn't end up using ThePosterDB, the admin dashboard's poster section now shows
-  *why* (e.g. "3 candidates read, 3 right type, 1 English, 3 Original variation" - so you can
-  tell at a glance whether it's a genuine language mismatch vs. something else) instead of only
-  being visible in the logs.
+**Latest fix - this is an important one:** every scraper fix in this update was capable of
+"working" but never actually helping, because a *previous* broken attempt for the same title had
+already recorded a confirmed "not found" that gets remembered for `TPDB_NEGATIVE_CACHE_DAYS`
+(3 days by default). The live resolution chain respected that cooldown and skipped trying again
+- while "Browse all options" never checked the cooldown at all, so it always did a fresh check
+and found things fine. That mismatch ("browse shows it, the live chain won't try again for
+days") is exactly what was being reported. Fixed two ways:
+- The app now tracks a scraper-logic version number and **automatically clears every remembered
+  ThePosterDB verdict on startup whenever that logic has meaningfully changed** - so upgrading
+  never leaves you stuck behind an old cooldown again. You should see a log line like
+  `ThePosterDB scraper logic updated (vN) - cleared N remembered verdict(s)` on this restart.
+- "Browse all options" and the live chain now scan the exact same number of candidates (they
+  didn't before - browse checked slightly more, which could also explain a mismatch on its own).
 
-Earlier fixes in this same update: the `Language:`/`Type:`/`Variation:` fields on a poster's
-detail page render as three separate lines, not one line joined by a separator - fixed to match
-the real structure, verified directly against live pages. ThePosterDB also sits behind
-Cloudflare, which was blocking this app's plain custom User-Agent - every request now presents as
-a real browser. And candidate posters are read directly off the disambiguation page (confirmed to
-already list one "Cover" entry per uploader by default) instead of opening each `/set/{id}`
-separately.
+Once this fix lands, the log line also distinguishes "still on cooldown, skipping" from "just
+checked, found nothing" (previously both looked identical in the logs).
+
+Earlier fixes in this same update: cheerio's `.text()` includes `<script>`/`<style>` tag
+contents by default, and ThePosterDB is a Livewire/Alpine-heavy site with embedded JSON state
+blobs - these were occasionally containing text that looked enough like `Type:`/`Language:`
+labels to get matched instead of the real ones. ThePosterDB requests now also go through their
+own concurrency limit (`TPDB_MAX_CONCURRENT`, default 4) instead of sharing the general
+`MAX_CONCURRENT_FETCHES` pool. And the admin dashboard's poster section now shows *why* ThePosterDB
+didn't win when it doesn't, instead of that only being visible in the logs.
+
+Further back: the `Language:`/`Type:`/`Variation:` fields on a poster's detail page render as
+three separate lines, not one line joined by a separator - fixed to match the real structure,
+verified directly against live pages. ThePosterDB also sits behind Cloudflare, which was blocking
+this app's plain custom User-Agent - every request now presents as a real browser. And candidate
+posters are read directly off the disambiguation page (confirmed to already list one "Cover"
+entry per uploader by default) instead of opening each `/set/{id}` separately.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,
@@ -121,10 +131,6 @@ just pull the new image and restart:
 ```bash
 docker compose pull && docker compose up -d
 ```
-
-If you want previously "not found" items to be retried with the fixed scraper right away rather
-than waiting out the `TPDB_NEGATIVE_CACHE_DAYS` cooldown, use "Re-run chain" on those items in the
-admin dashboard (or wait - the cooldown is only a few days).
 
 **Other behavior changes worth knowing about:**
 
