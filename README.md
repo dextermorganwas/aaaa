@@ -92,20 +92,27 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest fix:** the `Language:`/`Type:`/`Variation:` fields on a poster's detail page render as
-three separate lines, not one line joined by a separator - an earlier version of this scraper
-assumed a separator that doesn't exist, so it found real candidates but could never confirm
-their language/variation and rejected all of them. Verified directly against live pages this
-time (not inferred) and rewritten to match the real structure. The poster's caption is now also
-read from the page's own `<title>` tag (`"{Caption} Poster | TPDb"`), which is far more reliable
-than the previous body-text approach.
+**Latest fix:** cheerio's `.text()` includes `<script>`/`<style>` tag contents by default, and
+ThePosterDB is a Livewire/Alpine-heavy site with embedded JSON state blobs - these were
+occasionally containing text that looked enough like `Type:`/`Language:` labels to get matched
+instead of the real ones, corrupting the result for *some* titles but not others (which matched
+exactly what was reported: "browse shows it, live doesn't"). Script/style content is now stripped
+before extraction. Two smaller improvements alongside it:
+- ThePosterDB requests now go through their own concurrency limit (`TPDB_MAX_CONCURRENT`,
+  default 4) instead of sharing the general `MAX_CONCURRENT_FETCHES` pool with TMDB/TVDB, so
+  scraping load on ThePosterDB specifically is easy to tune independently.
+- When a title doesn't end up using ThePosterDB, the admin dashboard's poster section now shows
+  *why* (e.g. "3 candidates read, 3 right type, 1 English, 3 Original variation" - so you can
+  tell at a glance whether it's a genuine language mismatch vs. something else) instead of only
+  being visible in the logs.
 
-Earlier fix in this same update: ThePosterDB sits behind Cloudflare, which was silently
-blocking/degrading requests from this app's plain custom User-Agent. Every request now presents
-as a real browser (matching what the reference community scrapers do). It also reads candidate
-posters directly off the disambiguation page (which already lists exactly one - the "Cover" -
-entry per uploader by default, confirmed by fetching it directly) instead of opening each
-`/set/{id}` page separately.
+Earlier fixes in this same update: the `Language:`/`Type:`/`Variation:` fields on a poster's
+detail page render as three separate lines, not one line joined by a separator - fixed to match
+the real structure, verified directly against live pages. ThePosterDB also sits behind
+Cloudflare, which was blocking this app's plain custom User-Agent - every request now presents as
+a real browser. And candidate posters are read directly off the disambiguation page (confirmed to
+already list one "Cover" entry per uploader by default) instead of opening each `/set/{id}`
+separately.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,

@@ -2,21 +2,31 @@
 // ThePosterDB has no official API. This scrapes the public site the same way community tools
 // (plex-theposterdb, artwork-uploader-plex) do.
 //
-// Two things worth recording here for future-me:
+// Things worth recording here for future-me:
 // 1. ThePosterDB sits behind Cloudflare and appears to degrade/block non-browser User-Agents -
 //    every request here spoofs a real Chrome UA + client-hint headers, matching what the
 //    reference scrapers do. Without this, every request silently comes back empty.
 // 2. The disambiguation page (/posters/{id}) with NO query params already shows exactly one
 //    row per uploader/set, and that row is always the "Show Cover" (for series) - verified by
-//    fetching it directly and finding zero season-suffixed captions in the default view. That
-//    means candidate poster ids can be read straight off THIS page, without needing to open
-//    each /set/{id} separately at all.
+//    fetching it directly and finding zero season-suffixed captions in the default view, and by
+//    the page's own filter UI showing Season=Show Cover and Variation=Original as the
+//    pre-selected defaults (only Language defaults to "All"). That means candidate poster ids
+//    can be read straight off this page, without needing to open each /set/{id} separately.
+// 3. cheerio's .text() includes <script>/<style> contents by default, and this is a Livewire/
+//    Alpine-heavy site with embedded JSON state blobs - getPosterMeta() strips those out before
+//    extracting text, since leaving them in was silently corrupting field extraction for some
+//    titles (whichever ones happened to have a matching substring earlier in the page).
+// 4. Requests to ThePosterDB are rate-limited to their own, lower concurrency cap
+//    (TPDB_MAX_CONCURRENT, separate from MAX_CONCURRENT_FETCHES) to be a reasonable citizen
+//    toward a site with no official API, independent of how much TMDB/TVDB traffic is allowed.
 const cheerio = require('cheerio');
+const pLimit = require('p-limit');
 const config = require('../config');
 const logger = require('../logger');
 const { fetchText, fetchBuffer } = require('../lib/httpClient');
 
 const BASE = 'https://theposterdb.com';
+const tpdbLimit = pLimit(config.tpdbMaxConcurrent);
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -40,7 +50,7 @@ function normalizeTitle(t) {
 
 async function get(path) {
   const url = path.startsWith('http') ? path : `${BASE}${path}`;
-  return fetchText(url, { timeoutMs: config.tpdbTimeoutMs, headers: BROWSER_HEADERS });
+  return tpdbLimit(() => fetchText(url, { timeoutMs: config.tpdbTimeoutMs, headers: BROWSER_HEADERS }));
 }
 
 /** Step 1: find the /posters/{id} "all posters for this title" disambiguation page. */
@@ -140,6 +150,10 @@ async function getPosterMeta(assetId) {
   const html = await get(`/poster/${assetId}`);
   if (!html) return null;
   const $ = cheerio.load(html);
+  // .text() includes <script>/<style> contents by default - this site is Livewire/Alpine-heavy
+  // and embeds JSON state blobs that can coincidentally contain "Type:"/"Language:"-like
+  // substrings, which was silently corrupting extraction for some titles. Strip them first.
+  $('script, style, noscript, template').remove();
 
   const titleTag = $('title').text().trim();
   const caption = titleTag ? titleTag.replace(/\s*Poster\s*\|\s*TPDb\s*$/i, '').trim() : null;
@@ -185,16 +199,29 @@ async function evaluateCandidate(candidate, { mediaType }) {
  * "we couldn't read TPDB's page at all" (scraperError: true) so the caller doesn't cache a
  * scraping failure as a confirmed negative for days.
  */
+function summarizeEvaluations(evaluations, mediaType) {
+  const parsed = evaluations.filter(Boolean);
+  if (!parsed.length) return 'candidates found but none could be read';
+  const wantType = mediaType === 'series' ? 'show' : 'movie';
+  const typeOkCount = parsed.filter((e) => new RegExp(wantType, 'i').test(e.type || '')).length;
+  const englishCount = parsed.filter((e) => /^english$/i.test(e.language || '')).length;
+  const originalCount = parsed.filter((e) => /^original$/i.test(e.variation || '')).length;
+  const coverCount = mediaType === 'series' ? parsed.filter((e) => isCoverCaption(e.caption)).length : parsed.length;
+  const parts = [`${parsed.length} candidate(s) read`, `${typeOkCount} right type`, `${englishCount} English`, `${originalCount} Original variation`];
+  if (mediaType === 'series') parts.push(`${coverCount} Show Cover`);
+  return parts.join(', ');
+}
+
 async function findEnglishOriginalPoster({ title, year, mediaType }) {
   const postersPageId = await findPostersPageId({ title, year, mediaType });
-  if (!postersPageId) return { postersPageId: null, result: null, scraperError: false };
+  if (!postersPageId) return { postersPageId: null, result: null, scraperError: false, reason: 'no matching title page found in search' };
 
   const { candidates, parsedRows } = await getCoverCandidates(postersPageId, config.tpdbMaxCandidates);
   if (!candidates.length) {
     // The disambiguation page resolved, but we couldn't extract a single poster id from it -
     // that's suspicious (TPDB markup likely changed), not a genuine "no posters" situation.
     logger.warn(`ThePosterDB: found title page /posters/${postersPageId} but could not parse any poster candidates from it - the scraper may need updating.`);
-    return { postersPageId, result: null, scraperError: true };
+    return { postersPageId, result: null, scraperError: true, reason: 'found title page but could not parse any candidates (scraper may need updating)' };
   }
 
   const evaluations = await Promise.all(
@@ -209,20 +236,20 @@ async function findEnglishOriginalPoster({ title, year, mediaType }) {
   const parsedCount = evaluations.filter(Boolean).length;
   if (parsedCount === 0 && parsedRows > 0) {
     logger.warn(`ThePosterDB: found ${candidates.length} candidate(s) for /posters/${postersPageId} but none of their detail pages could be read - the scraper may need updating.`);
-    return { postersPageId, result: null, scraperError: true };
+    return { postersPageId, result: null, scraperError: true, reason: `found ${candidates.length} candidates but none of their detail pages could be read (scraper may need updating)` };
   }
 
   for (const evalResult of evaluations) {
     if (evalResult && evalResult.qualifiesType && /^english$/i.test(evalResult.language) && /^original$/i.test(evalResult.variation)) {
-      return { postersPageId, result: evalResult, scraperError: false };
+      return { postersPageId, result: evalResult, scraperError: false, reason: null };
     }
   }
-  return { postersPageId, result: null, scraperError: false };
+  return { postersPageId, result: null, scraperError: false, reason: summarizeEvaluations(evaluations, mediaType) };
 }
 
 async function downloadPoster(assetId) {
   const url = assetImageUrl(assetId);
-  const result = await fetchBuffer(url, { timeoutMs: config.tpdbTimeoutMs * 3, headers: BROWSER_HEADERS });
+  const result = await tpdbLimit(() => fetchBuffer(url, { timeoutMs: config.tpdbTimeoutMs * 3, headers: BROWSER_HEADERS }));
   if (!result) return null;
   return { ...result, sourceUrl: url };
 }

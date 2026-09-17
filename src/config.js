@@ -75,6 +75,10 @@ module.exports = {
   // How many candidate ThePosterDB sets to actually open (each costs one request) before
   // giving up on a title. Keep this modest - it directly controls TPDB load & latency.
   tpdbMaxCandidates: int(process.env.TPDB_MAX_CANDIDATES, 10),
+  // ThePosterDB has no official API and no rate-limit contract, so its own concurrency cap is
+  // intentionally lower and separate from MAX_CONCURRENT_FETCHES (which also serves TMDB/TVDB,
+  // both fine with more parallel load). This is the main lever for how fast this app hits TPDB.
+  tpdbMaxConcurrent: int(process.env.TPDB_MAX_CONCURRENT, 4),
 
   // --- Placeholder behaviour ---
   // If true, a request that resolves to "no art anywhere" gets a 302 to placeholderUrl

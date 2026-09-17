@@ -84,6 +84,7 @@ function safeAddColumn(table, columnDef) {
 }
 safeAddColumn('art', 'reason TEXT');
 safeAddColumn('tpdb_match_cache', 'last_error_at TEXT');
+safeAddColumn('tpdb_match_cache', 'last_reason TEXT');
 
 logger.info(`SQLite database ready at ${config.dbPath}`);
 
@@ -222,21 +223,21 @@ function getTpdbMatch(mediaId) {
   return db.prepare(`SELECT * FROM tpdb_match_cache WHERE media_id = ?`).get(mediaId);
 }
 
-function setTpdbMatch(mediaId, postersPageId, notFound = false) {
+function setTpdbMatch(mediaId, postersPageId, notFound = false, reason = null) {
   db.prepare(
-    `INSERT INTO tpdb_match_cache (media_id, posters_page_id, not_found, last_error_at, updated_at)
-     VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP)
+    `INSERT INTO tpdb_match_cache (media_id, posters_page_id, not_found, last_error_at, last_reason, updated_at)
+     VALUES (?, ?, ?, NULL, ?, CURRENT_TIMESTAMP)
      ON CONFLICT(media_id) DO UPDATE SET posters_page_id=excluded.posters_page_id,
-       not_found=excluded.not_found, last_error_at=NULL, updated_at=CURRENT_TIMESTAMP`
-  ).run(mediaId, postersPageId || null, notFound ? 1 : 0);
+       not_found=excluded.not_found, last_error_at=NULL, last_reason=excluded.last_reason, updated_at=CURRENT_TIMESTAMP`
+  ).run(mediaId, postersPageId || null, notFound ? 1 : 0, reason || null);
 }
 
-function setTpdbError(mediaId) {
+function setTpdbError(mediaId, reason = null) {
   db.prepare(
-    `INSERT INTO tpdb_match_cache (media_id, last_error_at, updated_at)
-     VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-     ON CONFLICT(media_id) DO UPDATE SET last_error_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP`
-  ).run(mediaId);
+    `INSERT INTO tpdb_match_cache (media_id, last_error_at, last_reason, updated_at)
+     VALUES (?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(media_id) DO UPDATE SET last_error_at=CURRENT_TIMESTAMP, last_reason=excluded.last_reason, updated_at=CURRENT_TIMESTAMP`
+  ).run(mediaId, reason || null);
 }
 
 // ---------- negative cache ("checked everywhere, found nothing") ----------

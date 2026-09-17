@@ -89,6 +89,17 @@ backBtn.addEventListener('click', () => {
   loadList(searchInput.value.trim());
 });
 
+function tpdbStatusHtml(media, artType, currentArt) {
+  if (artType !== 'poster' || !media.tpdbStatus) return '';
+  if (currentArt && currentArt.source === 'theposterdb') return ''; // TPDB already won, nothing to explain
+  const s = media.tpdbStatus;
+  let line;
+  if (s.hasError) line = `ThePosterDB: temporary error, will retry automatically (${escapeHtml(s.reason || 'unknown error')})`;
+  else if (s.notFound) line = `ThePosterDB: no qualifying (English/Original/Show Cover) poster found - ${escapeHtml(s.reason || '')}`;
+  else return '';
+  return `<div class="tpdb-status" style="margin-top:10px;font-size:12px;color:#9aa2b1;">${line} <span style="opacity:.7;">(checked ${new Date(s.checkedAt).toLocaleString()})</span></div>`;
+}
+
 function artSectionHtml(media, artType) {
   const a = artFor(media, artType);
   const thumbClass = artType;
@@ -112,9 +123,11 @@ function artSectionHtml(media, artType) {
             <div><span class="label">Cached:</span> ${a.cacheForever ? 'forever' : a.expiresAt ? `until ${new Date(a.expiresAt).toLocaleString()}` : '—'}</div>
             <div><span class="label">Fetched:</span> ${new Date(a.fetchedAt).toLocaleString()}</div>
           ` : `<div>Not resolved yet - it will be fetched the first time Stremio requests it, or click "Browse all options" to pick one now.</div>`}
+          ${tpdbStatusHtml(media, artType, a)}
         </div>
       </div>
       <div class="options-grid hidden"></div>
+
     </div>`;
 }
 

@@ -127,17 +127,17 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
   try {
     outcome = await tpdb.findEnglishOriginalPoster({ title, year, mediaType: ctx.type });
   } catch (e) {
-    db.setTpdbError(mediaRow.id);
+    db.setTpdbError(mediaRow.id, e.message);
     throw e;
   }
-  const { postersPageId, result, scraperError } = outcome;
+  const { postersPageId, result, scraperError, reason } = outcome;
   if (scraperError) {
     // Something about the page couldn't be parsed - back off briefly like any other error,
     // but don't record a confirmed "not found" (which would stick around for days).
-    db.setTpdbError(mediaRow.id);
+    db.setTpdbError(mediaRow.id, reason);
     return null;
   }
-  db.setTpdbMatch(mediaRow.id, postersPageId, !result);
+  db.setTpdbMatch(mediaRow.id, postersPageId, !result, reason);
   if (!result) return null;
 
   const dl = await tpdb.downloadPoster(result.assetId);

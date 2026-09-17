@@ -13,6 +13,7 @@ router.use(express.json());
 
 function serializeMedia(row) {
   const art = db.getArtForMedia(row.id);
+  const tpdbMatch = row.type ? db.getTpdbMatch(row.id) : null;
   return {
     id: row.id,
     type: row.type,
@@ -23,6 +24,14 @@ function serializeMedia(row) {
     year: row.year,
     originalLanguage: row.original_language,
     updatedAt: row.updated_at,
+    tpdbStatus: tpdbMatch
+      ? {
+          notFound: !!tpdbMatch.not_found,
+          hasError: !!tpdbMatch.last_error_at,
+          reason: tpdbMatch.last_reason,
+          checkedAt: tpdbMatch.updated_at,
+        }
+      : null,
     art: art.map((a) => ({
       artType: a.art_type,
       source: a.source,
