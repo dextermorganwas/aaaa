@@ -6,6 +6,7 @@ const logger = require('../logger');
 const config = require('../config');
 const resolver = require('../resolvers/resolveArt');
 const browseOptions = require('../resolvers/browseOptions');
+const tmdb = require('../providers/tmdb');
 const { fetchBuffer } = require('../lib/httpClient');
 
 const router = express.Router();
@@ -90,20 +91,29 @@ router.get('/art-file/:mediaId/:artType', (req, res) => {
 router.post('/media/:id/override', async (req, res) => {
   const row = db.getMediaById(Number(req.params.id));
   if (!row) return res.status(404).json({ error: 'Not found' });
-  const { artType, source, imageUrl } = req.body || {};
+  const { artType, source, imageUrl, sourceId } = req.body || {};
   if (!['poster', 'backdrop', 'logo'].includes(artType) || !imageUrl) {
     return res.status(400).json({ error: 'artType and imageUrl are required' });
   }
   try {
-    const dl = await fetchBuffer(imageUrl, { timeoutMs: 15000 });
+    // The browse grid's imageUrl is a small preview size (fine for a thumbnail) - for a TMDB
+    // pick, reconstruct the URL at the size actually configured for this art type instead of
+    // downloading that preview size as the final art. Other sources don't offer resizable URLs.
+    let downloadUrl = imageUrl;
+    if (source === 'tmdb' && sourceId) {
+      const sizeByType = { poster: config.tmdbPosterSize, backdrop: config.tmdbBackdropSize, logo: config.tmdbLogoSize };
+      downloadUrl = tmdb.fullImageUrl(sourceId, sizeByType[artType]) || imageUrl;
+    }
+
+    const dl = await fetchBuffer(downloadUrl, { timeoutMs: 15000 });
     if (!dl) return res.status(502).json({ error: 'Could not download that image URL' });
 
     const previous = db.getArt(row.id, artType);
-    const localPath = cache.save({ mediaId: row.id, artType, source: source || 'manual', buffer: dl.buffer, contentType: dl.contentType, sourceUrl: imageUrl });
+    const localPath = cache.save({ mediaId: row.id, artType, source: source || 'manual', buffer: dl.buffer, contentType: dl.contentType, sourceUrl: downloadUrl });
     const saved = db.upsertArt(row.id, artType, {
       source: source || 'manual',
       sourceRef: 'manual-override',
-      sourceUrl: imageUrl,
+      sourceUrl: downloadUrl,
       localPath,
       contentType: dl.contentType,
       language: null,

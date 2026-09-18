@@ -26,7 +26,8 @@ async function listTpdbCandidates(ctx, mediaRow) {
   const year = ctx.year || mediaRow.year;
   if (!title) return { primary: [], more: [] };
 
-  const postersPageId = await tpdb.findPostersPageId({ title, year, mediaType: ctx.type }).catch(() => null);
+  const postersPageIds = await tpdb.findPostersPageIds({ title, year, mediaType: ctx.type }).catch(() => []);
+  const postersPageId = postersPageIds[0];
   if (!postersPageId) return { primary: [], more: [] };
 
   const { primary, more } = await tpdb.browseCandidates(postersPageId, { mediaType: ctx.type }).catch((e) => {

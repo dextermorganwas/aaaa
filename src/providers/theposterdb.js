@@ -71,13 +71,13 @@ async function get(path) {
   });
 }
 
-/** Step 1: find the /posters/{id} "all posters for this title" disambiguation page. */
-async function findPostersPageId({ title, year, mediaType }) {
-  const section = mediaType === 'series' ? 'shows' : 'movies';
-  const html = await get(`/search?${new URLSearchParams({ term: title, section })}`);
-  if (!html) return null;
+/** Fetches one page of /search results and extracts {id, text} candidates from it. */
+async function searchPage(title, section, page) {
+  const params = new URLSearchParams({ term: title, section });
+  if (page > 1) params.set('page', String(page));
+  const html = await get(`/search?${params.toString()}`);
+  if (!html) return [];
   const $ = cheerio.load(html);
-  const wantTitle = normalizeTitle(title);
   const candidates = [];
 
   $('a[href*="/posters/"]').each((_, el) => {
@@ -97,13 +97,34 @@ async function findPostersPageId({ title, year, mediaType }) {
       if (text) candidates.push({ id: m[2], text });
     }
   }
+  return candidates;
+}
 
-  const yearMatch = candidates.find((c) => normalizeTitle(c.text.split('(')[0]) === wantTitle && c.text.includes(String(year || '####')));
-  if (yearMatch) return yearMatch.id;
-  const titleMatch = candidates.find((c) => normalizeTitle(c.text.split('(')[0]) === wantTitle);
-  if (titleMatch) return titleMatch.id;
-  const loose = candidates.find((c) => normalizeTitle(c.text).includes(wantTitle));
-  return loose ? loose.id : null;
+/**
+ * Step 1: find every /posters/{id} "all posters for this title" disambiguation page that
+ * plausibly matches, ranked best-first (exact title+year, then exact title, then loose match).
+ * Some titles have more than one matching page on ThePosterDB - a duplicate/near-duplicate
+ * entry, sometimes an empty one - so this returns all of them rather than just the first, and
+ * fetches a second page of search results too in case the real match isn't on page 1.
+ */
+async function findPostersPageIds({ title, year, mediaType }) {
+  const section = mediaType === 'series' ? 'shows' : 'movies';
+  const wantTitle = normalizeTitle(title);
+  const all = [];
+  for (let page = 1; page <= config.tpdbMaxSearchPages; page++) {
+    const found = await searchPage(title, section, page);
+    if (!found.length) break; // no more results, stop paginating
+    all.push(...found);
+  }
+
+  const seen = new Set();
+  const dedup = all.filter((c) => (seen.has(c.id) ? false : (seen.add(c.id), true)));
+
+  const exactYear = dedup.filter((c) => normalizeTitle(c.text.split('(')[0]) === wantTitle && c.text.includes(String(year || '####')));
+  const exactTitle = dedup.filter((c) => normalizeTitle(c.text.split('(')[0]) === wantTitle && !exactYear.includes(c));
+  const loose = dedup.filter((c) => normalizeTitle(c.text).includes(wantTitle) && !exactYear.includes(c) && !exactTitle.includes(c));
+
+  return [...exactYear, ...exactTitle, ...loose].map((c) => c.id);
 }
 
 /** Builds a disambiguation-page URL using the site's own real filter query params. */
@@ -148,41 +169,70 @@ async function getCandidateIds(postersPageId, opts = {}) {
   return ids;
 }
 
+/** A ThePosterDB pick is only used if there's enough community curation behind it: either
+ *  several English/Original candidates to choose from, or the title's been around long enough
+ *  that a good one has likely surfaced regardless of upload count. Otherwise the existing/
+ *  fallback art is left alone rather than replaced with a single low-effort upload. */
+function passesQualityGate(candidateCount, year) {
+  if (!config.tpdbQualityGateEnabled) return { pass: true };
+  if (candidateCount >= config.tpdbMinCandidates) return { pass: true };
+  const age = year ? new Date().getFullYear() - parseInt(year, 10) : null;
+  if (age !== null && Number.isFinite(age) && age >= config.tpdbMinAgeYears) return { pass: true };
+  const ageDesc = age !== null ? `${age} year(s) old` : 'unknown age';
+  return {
+    pass: false,
+    reason: `ThePosterDB has ${candidateCount} English/Original candidate(s), but this title doesn't meet the quality bar yet (needs ${config.tpdbMinCandidates}+ candidates or ${config.tpdbMinAgeYears}+ years old; this is ${ageDesc}) - kept existing/fallback art instead`,
+  };
+}
+
 /**
- * The full chain: search -> disambiguation page requested PRE-FILTERED to
- * English + Original (+ Show Cover for series), sorted by Downloads -> take the first result.
- * This is what the site's own filter UI does when a person sets it up manually.
+ * The full chain: search (up to a couple of pages) -> every plausibly-matching disambiguation
+ * page, tried in order -> each requested PRE-FILTERED to English + Original (+ Show Cover for
+ * series), sorted by Downloads -> the first result to pass the quality gate wins. Trying more
+ * than one title page matters in practice: some titles have a duplicate/empty entry on
+ * ThePosterDB ranked ahead of the real one.
  *
  * Distinguishes "TPDB genuinely has nothing matching" from "we couldn't read TPDB's page at
- * all" by also checking the unfiltered page when the filtered one comes back empty - if EVEN
- * the unfiltered page yields nothing, that's a scraper problem, not a real negative.
+ * all" - the latter (scraperError: true) only fires when NONE of the checked title pages could
+ * be parsed at all, not just when a title legitimately has no posters uploaded yet.
  */
 async function findEnglishOriginalPoster({ title, year, mediaType }) {
-  const postersPageId = await findPostersPageId({ title, year, mediaType });
-  if (!postersPageId) return { postersPageId: null, result: null, scraperError: false, reason: 'no matching title page found in search' };
+  const postersPageIds = await findPostersPageIds({ title, year, mediaType });
+  if (!postersPageIds.length) return { postersPageId: null, result: null, scraperError: false, reason: 'no matching title page found in search' };
 
-  const filtered = await getCandidateIds(postersPageId, { mediaType, language: 'en', variation: 'orig' });
-  if (filtered.length) {
-    const assetId = filtered[0];
-    return {
-      postersPageId,
-      result: { assetId, imageUrl: assetImageUrl(assetId), language: 'English', variation: 'Original' },
-      scraperError: false,
-      reason: null,
-    };
+  const pagesToTry = postersPageIds.slice(0, config.tpdbMaxAlternateTitlePages);
+  let anyContentFound = false;
+  let bestReason = null;
+
+  for (const postersPageId of pagesToTry) {
+    const filtered = await getCandidateIds(postersPageId, { mediaType, language: 'en', variation: 'orig' });
+    if (filtered.length) {
+      anyContentFound = true;
+      const gate = passesQualityGate(filtered.length, year);
+      if (gate.pass) {
+        const assetId = filtered[0];
+        return {
+          postersPageId,
+          result: { assetId, imageUrl: assetImageUrl(assetId), language: 'English', variation: 'Original' },
+          scraperError: false,
+          reason: null,
+        };
+      }
+      bestReason = gate.reason;
+      continue; // didn't clear the quality bar - a different (duplicate) title page might do better
+    }
+    const unfiltered = await getCandidateIds(postersPageId, { mediaType });
+    if (unfiltered.length) {
+      anyContentFound = true;
+      bestReason = bestReason || `ThePosterDB has ${unfiltered.length} poster(s) for this title, but none in English/Original${mediaType === 'series' ? '/Show Cover' : ''}`;
+    }
   }
 
-  const unfiltered = await getCandidateIds(postersPageId, { mediaType });
-  if (!unfiltered.length) {
-    logger.warn(`ThePosterDB: found title page /posters/${postersPageId} but could not parse any poster candidates from it (filtered or unfiltered) - the scraper may need updating.`);
-    return { postersPageId, result: null, scraperError: true, reason: 'found title page but could not parse any candidates at all (scraper may need updating)' };
+  if (!anyContentFound) {
+    logger.warn(`ThePosterDB: found ${pagesToTry.length} title page(s) for "${title}" but could not parse any poster candidates from any of them - the scraper may need updating.`);
+    return { postersPageId: pagesToTry[0], result: null, scraperError: true, reason: `found ${pagesToTry.length} title page(s) but could not parse any candidates at all (scraper may need updating)` };
   }
-  return {
-    postersPageId,
-    result: null,
-    scraperError: false,
-    reason: `ThePosterDB has ${unfiltered.length} poster(s) for this title, but none in English/Original${mediaType === 'series' ? '/Show Cover' : ''}`,
-  };
+  return { postersPageId: pagesToTry[0], result: null, scraperError: false, reason: bestReason || 'no qualifying candidates found' };
 }
 
 async function downloadPoster(assetId) {
@@ -216,16 +266,16 @@ async function browseCandidates(postersPageId, { mediaType }) {
 // Bump this whenever a change to the matching/parsing logic above could flip a previous
 // verdict (a "not found" that should now be found, or vice versa) - db.js uses it to
 // auto-invalidate remembered ThePosterDB verdicts on startup so old bugs don't linger as
-// cooldowns after they're fixed. Last bumped: switched from per-candidate detail-page scraping
-// to the site's own real filter query parameters (?language=en&season=n&variation=orig&...).
-const TPDB_SCRAPER_VERSION = 6;
+// cooldowns after they're fixed. Last bumped: try multiple matching title pages (not just the
+// first) and multiple search-result pages, added the candidate-count/age quality gate.
+const TPDB_SCRAPER_VERSION = 7;
 
 module.exports = {
   TPDB_SCRAPER_VERSION,
   findEnglishOriginalPoster,
   downloadPoster,
   assetImageUrl,
-  findPostersPageId,
+  findPostersPageIds,
   getCandidateIds,
   browseCandidates,
 };

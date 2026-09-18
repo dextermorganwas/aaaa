@@ -258,7 +258,7 @@ async function applyOverride(mediaId, artType, opt) {
   try {
     await api(`/media/${mediaId}/override`, {
       method: 'POST',
-      body: JSON.stringify({ artType, source: opt.source, imageUrl: opt.imageUrl }),
+      body: JSON.stringify({ artType, source: opt.source, imageUrl: opt.imageUrl, sourceId: opt.id }),
     });
     const media = await api(`/media/${mediaId}`);
     renderDetail(media);

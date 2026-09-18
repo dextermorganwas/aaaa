@@ -86,6 +86,25 @@ module.exports = {
   // throughput to roughly 3-4 requests/second even under a large catalog-scan burst.
   tpdbMinRequestIntervalMs: int(process.env.TPDB_MIN_REQUEST_INTERVAL_MS, 300),
 
+  // --- ThePosterDB "quality gate" ---
+  // A ThePosterDB poster is only used if the title has at least this many English/Original
+  // candidates to choose from (more candidates tends to mean more community curation and a
+  // better pick)...
+  tpdbMinCandidates: int(process.env.TPDB_MIN_CANDIDATES, 3),
+  // ...OR the title is at least this many years old (newer titles with few uploads tend to have
+  // lower-quality posters; that risk goes away once a title's had time to accumulate real
+  // community attention). Either condition passing is enough.
+  tpdbMinAgeYears: int(process.env.TPDB_MIN_AGE_YEARS, 3),
+  tpdbQualityGateEnabled: bool(process.env.TPDB_QUALITY_GATE_ENABLED, true),
+
+  // --- ThePosterDB search breadth ---
+  // Some titles have more than one matching disambiguation page on ThePosterDB (duplicate/near-
+  // duplicate entries, or a genuinely distinct one that's empty) - this many are tried in order
+  // before giving up, so a dead first match doesn't block a working second one.
+  tpdbMaxAlternateTitlePages: int(process.env.TPDB_MAX_ALTERNATE_TITLE_PAGES, 3),
+  // How many pages of /search results to fetch before giving up on finding a matching title page.
+  tpdbMaxSearchPages: int(process.env.TPDB_MAX_SEARCH_PAGES, 2),
+
   // --- Placeholder behaviour ---
   // If true, a request that resolves to "no art anywhere" gets a 302 to placeholderUrl
   // instead of a 404, so Stremio/AIOMetadata never shows a broken image icon.

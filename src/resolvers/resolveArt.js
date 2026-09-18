@@ -120,7 +120,13 @@ function tpdbIsOnCooldown(mediaId) {
 async function resolvePosterViaTpdb(mediaRow, ctx) {
   const title = ctx.title || mediaRow.title;
   const year = ctx.year || mediaRow.year;
-  if (!title) return null;
+  if (!title) {
+    // Shouldn't normally happen (buildContext runs before this), but record it rather than
+    // silently vanishing - an untracked null here was one source of "dashboard shows nothing
+    // but the logs mention TPDB" confusion.
+    db.setTpdbError(mediaRow.id, 'no title available yet for a ThePosterDB search');
+    return null;
+  }
 
   let outcome;
   try {
@@ -136,11 +142,24 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
     db.setTpdbError(mediaRow.id, reason);
     return null;
   }
-  db.setTpdbMatch(mediaRow.id, postersPageId, !result, reason);
-  if (!result) return null;
+  if (!result) {
+    db.setTpdbMatch(mediaRow.id, postersPageId, true, reason);
+    return null;
+  }
 
   const dl = await tpdb.downloadPoster(result.assetId);
-  if (!dl) return null;
+  if (!dl) {
+    // A qualifying poster WAS found - the download itself failed (network blip, TPDB briefly
+    // rate-limiting the asset endpoint, etc). This is an error, not a "not found": recording it
+    // as not_found would be wrong (a real match exists) and would incorrectly suppress retries
+    // for days. This was the exact bug behind "logs say no qualifying poster found, but browse
+    // finds one and the dashboard shows nothing at all" - the match succeeded, the download
+    // silently didn't, and nothing recorded why.
+    db.setTpdbError(mediaRow.id, 'found a qualifying poster but the image download failed');
+    return null;
+  }
+  // A genuine match was found and downloaded - record it as such (not "not found").
+  db.setTpdbMatch(mediaRow.id, postersPageId, false, reason);
   return {
     source: 'theposterdb',
     sourceRef: result.assetId,
@@ -218,7 +237,15 @@ async function resolvePoster(mediaRow, ctx) {
     background.schedule(`tpdb-backfill-${mediaRow.id}`, async () => {
       const result = await tpdbPromise;
       if (!result) {
-        logger.info(`ThePosterDB backfill for media #${mediaRow.id}: no qualifying (English/Original${ctx.type === 'series' ? '/Show Cover' : ''}) poster found.`);
+        // Log whatever actually ended up recorded, rather than a generic message guessed from
+        // the return value alone - the two can diverge (e.g. a match was found but the image
+        // download failed, which is an error, not a "nothing qualifying" verdict).
+        const match = db.getTpdbMatch(mediaRow.id);
+        if (match && match.last_error_at) {
+          logger.warn(`ThePosterDB backfill for media #${mediaRow.id}: error - ${match.last_reason || 'unknown error'} (will retry automatically).`);
+        } else {
+          logger.info(`ThePosterDB backfill for media #${mediaRow.id}: ${match?.last_reason || `no qualifying (English/Original${ctx.type === 'series' ? '/Show Cover' : ''}) poster found`}.`);
+        }
         return;
       }
       const current = db.getArt(mediaRow.id, 'poster');

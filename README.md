@@ -92,36 +92,44 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest fix - the real one this time:** ThePosterDB's filter UI (Language/Season/Sort/Variation)
-actually syncs to the page URL as real query parameters - confirmed directly from a real browser
-session. The scraper now requests the disambiguation page pre-filtered exactly the way the site's
-own UI does it:
-```
-/posters/{id}?textless=All&language=en&season=n&sort=Downloads&variation=orig
-```
-(`season=n` = Show Cover, only present for series; `variation=orig` = Original). The first result
-in that already-filtered, Downloads-sorted list simply **is** a qualifying poster - no more
-opening each candidate's own detail page and parsing free text off it, which was the slow,
-fragile approach in every earlier version of this fix and kept breaking on parsing edge cases.
-This is a large simplification: title resolution now takes 2-3 requests total instead of up to a
-dozen, admin browsing is faster and more reliable, and there's a whole category of "text
-parsing broke for this specific title" bugs that can no longer happen because that parsing no
-longer exists.
+**Latest fixes:**
 
-Two related improvements:
-- ThePosterDB requests are now rate-limited on two axes: a concurrency cap (`TPDB_MAX_CONCURRENT`,
-  now 3) and a minimum spacing between requests (`TPDB_MIN_REQUEST_INTERVAL_MS`, 300ms) - the
-  latter is what actually bounds total throughput over time; concurrency alone doesn't.
-- As with every scraper-logic change, the app's scraper-version tracking means old remembered
-  "not found" verdicts are automatically cleared on this restart, so items get an honest fresh
-  check under the new logic rather than sitting behind a stale cooldown - watch for
-  `ThePosterDB scraper logic updated (v6) - cleared N remembered verdict(s)` in the startup logs.
+- **The actual root cause of "logs say TPDB checked it, dashboard shows nothing, browse finds
+  it fine":** when ThePosterDB found a genuinely qualifying poster but the subsequent image
+  *download* failed (a transient network blip), the match had already been recorded as "found"
+  in the database - so nothing marked it as an error, the dashboard had nothing to show, and the
+  background job logged a generic "no qualifying poster found" that was simply wrong. Fixed: a
+  download failure after a successful match is now recorded as an error (visible in the
+  dashboard, retried automatically), and the log line always reflects whatever actually ended up
+  stored instead of guessing from the return value alone.
+- **A misleading warning:** "found title page but could not parse any candidates" was firing for
+  titles that genuinely have zero posters uploaded to ThePosterDB (a legitimate, common case),
+  not just for real scraper breakage. That warning is now reserved for when *none* of the
+  title's candidate pages could be parsed at all; a title with a valid page and zero posters is
+  now just a normal, quiet "not found."
+- **Multiple/duplicate ThePosterDB entries:** some titles (e.g. Cowboy Bebop) have more than one
+  matching disambiguation page - sometimes a dead/empty duplicate ranked ahead of the real one.
+  The scraper now tries up to `TPDB_MAX_ALTERNATE_TITLE_PAGES` (default 3) matching pages in
+  order, and checks a second page of search results (`TPDB_MAX_SEARCH_PAGES`) if the match isn't
+  on the first.
+- **New "quality gate":** a ThePosterDB poster is only used if the title has at least
+  `TPDB_MIN_CANDIDATES` (default 3) English/Original candidates, or is at least
+  `TPDB_MIN_AGE_YEARS` (default 3) years old. Disable with `TPDB_QUALITY_GATE_ENABLED=false`.
+- **Admin override art size:** overriding a backdrop/poster/logo with a TMDB option from "Browse
+  all options" was downloading the small preview-thumbnail size shown in the browse grid instead
+  of the size configured in `.env` (`TMDB_BACKDROP_SIZE` etc). Fixed - overrides now respect your
+  configured sizes the same way the automatic chain does.
 
-Earlier fixes in this same update: a stale-cooldown mismatch between "browse" (no cooldown check)
-and the live chain (respected the cooldown), which was the reason earlier fixes "worked in
-browse but not live." Cheerio's `.text()` including `<script>`/`<style>` contents, which
-corrupted field parsing for some titles. ThePosterDB sitting behind Cloudflare and blocking this
-app's plain custom User-Agent - every request now presents as a real browser.
+As with every scraper-logic change, old remembered ThePosterDB verdicts are automatically
+cleared on this restart - watch for `ThePosterDB scraper logic updated (v7) - cleared N
+remembered verdict(s)` in the startup logs.
+
+Earlier fixes in this same update: ThePosterDB's filter UI (Language/Season/Sort/Variation)
+syncs to the page URL as real query parameters, so the scraper now requests pages pre-filtered
+the way the site's own UI does it instead of parsing free text off each candidate's detail page.
+A stale-cooldown mismatch between "browse" and the live chain. Cheerio's `.text()` including
+`<script>`/`<style>` contents. ThePosterDB sitting behind Cloudflare and blocking this app's
+plain custom User-Agent.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,
