@@ -92,44 +92,52 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest fixes:**
+**Latest fix - this was the real, root-cause bug behind the recurring "automatic path shows
+TMDB, browse/re-run chain show ThePosterDB fine" reports.** Traced (not guessed) to a caching
+architecture gap:
 
-- **The actual root cause of "logs say TPDB checked it, dashboard shows nothing, browse finds
-  it fine":** when ThePosterDB found a genuinely qualifying poster but the subsequent image
-  *download* failed (a transient network blip), the match had already been recorded as "found"
-  in the database - so nothing marked it as an error, the dashboard had nothing to show, and the
-  background job logged a generic "no qualifying poster found" that was simply wrong. Fixed: a
-  download failure after a successful match is now recorded as an error (visible in the
-  dashboard, retried automatically), and the log line always reflects whatever actually ended up
-  stored instead of guessing from the return value alone.
-- **A misleading warning:** "found title page but could not parse any candidates" was firing for
-  titles that genuinely have zero posters uploaded to ThePosterDB (a legitimate, common case),
-  not just for real scraper breakage. That warning is now reserved for when *none* of the
-  title's candidate pages could be parsed at all; a title with a valid page and zero posters is
-  now just a normal, quiet "not found."
-- **Multiple/duplicate ThePosterDB entries:** some titles (e.g. Cowboy Bebop) have more than one
-  matching disambiguation page - sometimes a dead/empty duplicate ranked ahead of the real one.
-  The scraper now tries up to `TPDB_MAX_ALTERNATE_TITLE_PAGES` (default 3) matching pages in
-  order, and checks a second page of search results (`TPDB_MAX_SEARCH_PAGES`) if the match isn't
-  on the first.
-- **New "quality gate":** a ThePosterDB poster is only used if the title has at least
-  `TPDB_MIN_CANDIDATES` (default 3) English/Original candidates, or is at least
-  `TPDB_MIN_AGE_YEARS` (default 3) years old. Disable with `TPDB_QUALITY_GATE_ENABLED=false`.
-- **Admin override art size:** overriding a backdrop/poster/logo with a TMDB option from "Browse
-  all options" was downloading the small preview-thumbnail size shown in the browse grid instead
-  of the size configured in `.env` (`TMDB_BACKDROP_SIZE` etc). Fixed - overrides now respect your
-  configured sizes the same way the automatic chain does.
+Once a poster resolves to anything, it's cached for up to `CACHE_TTL_DAYS_TMDB` days (30 by
+default) - and the resolver's very first check returns that cached art immediately without ever
+running the resolution chain (or ThePosterDB) again, for as long as that cache stays fresh. That
+means ThePosterDB effectively only ever got **one shot** at a title: whatever happened on its
+very first-ever resolution. If that one attempt lost - a transient network error, an old scraper
+bug that's since been fixed, ThePosterDB being briefly rate-limited - nothing would ever prompt a
+retry for up to a month, short of manually clicking "Re-run chain" (the only code path that
+bypasses that cache check). Every scraper fix in this whole thread was real and correct, but
+items that had already cached a non-TPDB poster before that fix landed had no way to benefit from
+it - which is exactly why the same handful of titles kept coming back.
 
-As with every scraper-logic change, old remembered ThePosterDB verdicts are automatically
-cleared on this restart - watch for `ThePosterDB scraper logic updated (v7) - cleared N
-remembered verdict(s)` in the startup logs.
+Fixed: serving a cached poster is still just as fast as before, but if that poster isn't already
+from ThePosterDB (and isn't a manual override), a background check now runs alongside it to see
+if ThePosterDB has something better - gated by the same cooldown as everywhere else, so it only
+does real work when there's actually something new to try, and coalesced so a burst of requests
+for the same popular item doesn't schedule redundant checks. This should be the end of the "why
+does this specific title never update" pattern.
 
-Earlier fixes in this same update: ThePosterDB's filter UI (Language/Season/Sort/Variation)
-syncs to the page URL as real query parameters, so the scraper now requests pages pre-filtered
-the way the site's own UI does it instead of parsing free text off each candidate's detail page.
-A stale-cooldown mismatch between "browse" and the live chain. Cheerio's `.text()` including
-`<script>`/`<style>` contents. ThePosterDB sitting behind Cloudflare and blocking this app's
-plain custom User-Agent.
+As with any change that could affect standing verdicts, old cooldowns are cleared automatically
+on this restart - watch for `ThePosterDB scraper logic updated (v8) - cleared N remembered
+verdict(s)` in the startup logs. You shouldn't need to click "Re-run chain" on anything after
+this update; give it a little time (background checks are still rate-limited) and previously
+"stuck" items should upgrade on their own the next time they're requested.
+
+Also fixed: **duplicate media rows.** If two requests for the same item arrive with genuinely
+non-overlapping id subsets (one has only an imdb id, another only a tmdb id), the app now
+cross-references them via TMDB before creating a new row, so they converge on the same one
+instead of silently becoming two permanently separate items - one of which quietly accumulates
+progress (like a ThePosterDB match) while the other, the one actually being served, never does.
+
+Earlier fixes in this same update: a download failure after a successful ThePosterDB match was
+recorded as a silent "found" state with no error flag, so nothing showed on the dashboard. A
+misleading warning fired for titles that genuinely have zero posters uploaded. Multiple/duplicate
+ThePosterDB entries for the same title now get retried across up to `TPDB_MAX_ALTERNATE_TITLE_PAGES`
+matching pages. A new quality gate skips low-effort ThePosterDB posters on very new titles
+(`TPDB_MIN_CANDIDATES` / `TPDB_MIN_AGE_YEARS`). Admin overrides now respect your configured
+image sizes instead of downloading the browse-grid preview size.
+
+Further back: ThePosterDB's filter UI syncs to the page URL as real query parameters, so the
+scraper requests pages pre-filtered the way the site's own UI does it. Cheerio's `.text()`
+including `<script>`/`<style>` contents. ThePosterDB sitting behind Cloudflare and blocking this
+app's plain custom User-Agent.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,

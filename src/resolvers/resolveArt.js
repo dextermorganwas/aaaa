@@ -171,6 +171,59 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
   };
 }
 
+/** Runs resolvePosterViaTpdb and either upgrades the current poster or logs why not, using
+ *  whatever actually ended up recorded in tpdb_match_cache as the source of truth for the log
+ *  message (never guessed from the return value alone - those can diverge, e.g. a match was
+ *  found but the image download failed, which is an error, not a "nothing qualifying" verdict).
+ *  Shared by the first-ever resolution path and the opportunistic re-check below. */
+async function applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label }) {
+  const result = await tpdbPromise;
+  if (!result) {
+    const match = db.getTpdbMatch(mediaRow.id);
+    if (match && match.last_error_at) {
+      logger.warn(`ThePosterDB ${label} for media #${mediaRow.id}: error - ${match.last_reason || 'unknown error'} (will retry automatically).`);
+    } else {
+      logger.info(`ThePosterDB ${label} for media #${mediaRow.id}: ${match?.last_reason || `no qualifying (English/Original${ctx.type === 'series' ? '/Show Cover' : ''}) poster found`}.`);
+    }
+    return;
+  }
+  const current = db.getArt(mediaRow.id, 'poster');
+  if (current && (current.is_override || current.source === 'theposterdb')) return;
+  await persistArt({ mediaId: mediaRow.id, artType: 'poster', ...result });
+  logger.info(`ThePosterDB ${label} complete for media #${mediaRow.id} - future requests will use it.`);
+}
+
+/** Fresh art cached from a previous resolution can be up to CACHE_TTL_DAYS_TMDB days old before
+ *  resolve() ever calls resolvePoster() again - which means, without this, ThePosterDB only
+ *  ever gets ONE shot at a title: whatever happened on its very first-ever resolution. If that
+ *  attempt lost to a transient error, an expired cooldown from an old scraper bug, or simply
+ *  hadn't been fixed yet, the item would stay on a worse poster for up to a month with nothing
+ *  ever prompting a retry short of someone manually clicking "Re-run chain". This runs
+ *  opportunistically alongside a fast cache-hit response instead: it doesn't block or slow that
+ *  response down, but gives ThePosterDB another chance in the background, gated by the same
+ *  cooldown as everywhere else so it only actually does work when there's something new to try. */
+const opportunisticTpdbInFlight = new Set();
+function scheduleOpportunisticTpdbCheck(mediaRow) {
+  if (tpdbIsOnCooldown(mediaRow.id)) return;
+  // A burst of near-simultaneous requests for the same popular item would otherwise each
+  // schedule their own redundant check before the first one finishes and records a cooldown
+  // (the DB-persisted cooldown only updates on completion) - this in-memory guard prevents that.
+  if (opportunisticTpdbInFlight.has(mediaRow.id)) return;
+  opportunisticTpdbInFlight.add(mediaRow.id);
+  background.schedule(`tpdb-recheck-${mediaRow.id}`, async () => {
+    try {
+      const ctx = { type: mediaRow.type, title: mediaRow.title, year: mediaRow.year, tmdbId: mediaRow.tmdb_id, imdbId: mediaRow.imdb_id, tvdbId: mediaRow.tvdb_id };
+      const tpdbPromise = resolvePosterViaTpdb(mediaRow, ctx).catch((e) => {
+        logger.debug('TPDB opportunistic re-check errored:', e.message);
+        return null;
+      });
+      await applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label: 're-check' });
+    } finally {
+      opportunisticTpdbInFlight.delete(mediaRow.id);
+    }
+  });
+}
+
 async function resolvePosterRestOfChain(mediaRow, ctx) {
   if (ctx.tmdbImages) {
     const img = tmdb.pickFirst(ctx.tmdbImages, 'posters', 'en');
@@ -234,25 +287,7 @@ async function resolvePoster(mediaRow, ctx) {
   });
 
   function scheduleBackfill() {
-    background.schedule(`tpdb-backfill-${mediaRow.id}`, async () => {
-      const result = await tpdbPromise;
-      if (!result) {
-        // Log whatever actually ended up recorded, rather than a generic message guessed from
-        // the return value alone - the two can diverge (e.g. a match was found but the image
-        // download failed, which is an error, not a "nothing qualifying" verdict).
-        const match = db.getTpdbMatch(mediaRow.id);
-        if (match && match.last_error_at) {
-          logger.warn(`ThePosterDB backfill for media #${mediaRow.id}: error - ${match.last_reason || 'unknown error'} (will retry automatically).`);
-        } else {
-          logger.info(`ThePosterDB backfill for media #${mediaRow.id}: ${match?.last_reason || `no qualifying (English/Original${ctx.type === 'series' ? '/Show Cover' : ''}) poster found`}.`);
-        }
-        return;
-      }
-      const current = db.getArt(mediaRow.id, 'poster');
-      if (current && (current.is_override || current.source === 'theposterdb')) return;
-      await persistArt({ mediaId: mediaRow.id, artType: 'poster', ...result });
-      logger.info(`ThePosterDB backfill complete for media #${mediaRow.id} - future requests will use it.`);
-    });
+    background.schedule(`tpdb-backfill-${mediaRow.id}`, () => applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label: 'backfill' }));
   }
 
   if (!config.tpdbInlineEnabled) {
@@ -365,14 +400,54 @@ const CHAINS = { poster: resolvePoster, backdrop: resolveBackdrop, logo: resolve
  * "re-run chain" button) WITHOUT discarding the existing row up front - if the fresh attempt
  * comes back empty, the old art keeps serving rather than the item going blank.
  */
+/** Cross-references ids via TMDB before creating a brand-new media row, so a request carrying
+ *  only a subset of ids (e.g. a catalog view with just a tmdb id) still converges on the same
+ *  row as a fuller request for the same item (e.g. a detail view with only an imdb id) - without
+ *  this, those could silently end up as two separate rows that never converge: one accumulates
+ *  real progress (like a ThePosterDB match) while the other - the one actually being served -
+ *  never does, with no error or trace anywhere to explain why. Only runs when a direct lookup
+ *  with the given ids finds nothing, so it costs an extra TMDB request only for genuinely new
+ *  id combinations, not on every request.
+ */
+async function resolveCanonicalIds({ type, tmdbId, imdbId, tvdbId }) {
+  const ids = { tmdbId, imdbId, tvdbId };
+  if (!tmdbId && imdbId && (config.tmdbApiKey || config.tmdbBearerToken)) {
+    const found = await tmdb.findByImdb(imdbId).catch(() => null);
+    const hit = found && (type === 'series' ? found.tv_results?.[0] : found.movie_results?.[0]);
+    if (hit) ids.tmdbId = String(hit.id);
+  }
+  if (ids.tmdbId && (!ids.imdbId || !ids.tvdbId)) {
+    const ext = await tmdb.getExternalIds({ type, tmdbId: ids.tmdbId }).catch(() => null);
+    if (ext) {
+      if (!ids.imdbId && ext.imdb_id) ids.imdbId = ext.imdb_id;
+      if (!ids.tvdbId && ext.tvdb_id) ids.tvdbId = String(ext.tvdb_id);
+    }
+  }
+  return ids;
+}
+
 async function resolve({ type, tmdbId, imdbId, tvdbId, artType, forceRefresh = false }) {
-  const mediaRow = db.findOrCreateMedia({ type, tmdbId, imdbId, tvdbId });
+  let ids = { tmdbId, imdbId, tvdbId };
+  if (!db.findMedia({ type, ...ids })) {
+    // Nothing matches the ids we were given directly - before creating a new row, see if TMDB
+    // can fill in the ones we're missing, in case an existing row for this same item is only
+    // findable via one of those.
+    ids = await resolveCanonicalIds({ type, ...ids }).catch(() => ids);
+  }
+  const mediaRow = db.findOrCreateMedia({ type, ...ids });
   db.logRequest(mediaRow.id, artType);
 
   const key = `${mediaRow.id}:${artType}`;
   return singleflight.run(key, async () => {
     const existing = db.getArt(mediaRow.id, artType);
     if (!forceRefresh && existing && !isExpired(existing) && cache.exists(existing.local_path)) {
+      // Serving from cache is fast on purpose, but for posters it shouldn't mean ThePosterDB
+      // never gets another chance: without this, once any non-TPDB poster is cached (up to
+      // CACHE_TTL_DAYS_TMDB days), nothing would prompt a retry until that cache expires or
+      // someone manually clicks "Re-run chain" - see scheduleOpportunisticTpdbCheck for why.
+      if (artType === 'poster' && existing.source !== 'theposterdb' && !existing.is_override) {
+        scheduleOpportunisticTpdbCheck(mediaRow);
+      }
       return existing;
     }
 

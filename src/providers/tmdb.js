@@ -80,6 +80,22 @@ async function findByImdb(imdbId) {
   }
 }
 
+/** Cross-references a tmdb id to its imdb/tvdb ids. Used to unify a request that only carries a
+ *  subset of ids (e.g. a catalog view with just a tmdb id) with an existing media row that was
+ *  first created from a different subset (e.g. a detail view with only an imdb id) - without
+ *  this, those could otherwise end up as two separate, never-converging database rows for the
+ *  same actual item. */
+async function getExternalIds({ type, tmdbId }) {
+  if (!tmdbId || (!config.tmdbApiKey && !config.tmdbBearerToken)) return null;
+  const url = withKey(`${API_BASE}/${tmdbType(type)}/${tmdbId}/external_ids`);
+  try {
+    return await fetchJson(url, { timeoutMs: config.tmdbTimeoutMs, headers: authHeaders(), allow404: true });
+  } catch (e) {
+    logger.debug('TMDB external_ids fetch failed:', e.message);
+    return null;
+  }
+}
+
 function fullImageUrl(filePath, size) {
   if (!filePath) return null;
   return `${IMG_BASE}/${size}/${filePath}`;
@@ -118,6 +134,7 @@ module.exports = {
   getImagesForLanguage,
   getDetails,
   findByImdb,
+  getExternalIds,
   fullImageUrl,
   pickFirst,
   downloadImage,

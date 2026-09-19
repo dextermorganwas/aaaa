@@ -263,12 +263,13 @@ async function browseCandidates(postersPageId, { mediaType }) {
   };
 }
 
-// Bump this whenever a change to the matching/parsing logic above could flip a previous
-// verdict (a "not found" that should now be found, or vice versa) - db.js uses it to
-// auto-invalidate remembered ThePosterDB verdicts on startup so old bugs don't linger as
-// cooldowns after they're fixed. Last bumped: try multiple matching title pages (not just the
-// first) and multiple search-result pages, added the candidate-count/age quality gate.
-const TPDB_SCRAPER_VERSION = 7;
+// Bump this whenever a change to the matching/parsing logic above, OR to how/when a verdict
+// gets recorded, could flip a previous verdict or leave a stale cooldown blocking a check that
+// should now happen - db.js uses it to auto-invalidate remembered ThePosterDB verdicts on
+// startup so old bugs don't linger as cooldowns after they're fixed. Last bumped: fixed a
+// download-failure being recorded as a silent success-shaped "found" state with no error flag,
+// and added an opportunistic re-check for cached items that never got a real first chance.
+const TPDB_SCRAPER_VERSION = 8;
 
 module.exports = {
   TPDB_SCRAPER_VERSION,
