@@ -172,6 +172,56 @@ function getMediaById(id) {
   return db.prepare(`SELECT * FROM media WHERE id = ?`).get(id);
 }
 
+/** Finds other media rows sharing any of this row's ids. This is possible for rows created
+ *  before cross-id reconciliation existed (see resolveArt.js's resolveCanonicalIds) - if
+ *  Stremio's automatic requests carry a different id subset than what created this row, they
+ *  could be silently resolving against a completely different, never-converging duplicate row
+ *  with its own independent art cache and ThePosterDB history. Surfaced directly in the admin
+ *  dashboard so this is verifiable rather than a guess. */
+function findPotentialDuplicates(row) {
+  const clauses = [];
+  const params = [];
+  if (row.tmdb_id) {
+    clauses.push('(type = ? AND tmdb_id = ?)');
+    params.push(row.type, row.tmdb_id);
+  }
+  if (row.imdb_id) {
+    clauses.push('(imdb_id = ?)');
+    params.push(row.imdb_id);
+  }
+  if (row.tvdb_id) {
+    clauses.push('(type = ? AND tvdb_id = ?)');
+    params.push(row.type, row.tvdb_id);
+  }
+  if (!clauses.length) return [];
+  return db
+    .prepare(`SELECT * FROM media WHERE id != ? AND (${clauses.join(' OR ')})`)
+    .all(row.id, ...params);
+}
+
+/** Merges a duplicate row into the canonical one: moves over any ids/title the canonical row is
+ *  missing, moves its request history, and deletes the duplicate (its art/tpdb history is
+ *  discarded - the canonical row's own history, if any, is kept as-is; use "Re-run chain" after
+ *  merging if the canonical row's art should be refreshed). */
+function mergeMediaRows(canonicalId, duplicateId) {
+  const canonical = getMediaById(canonicalId);
+  const duplicate = getMediaById(duplicateId);
+  if (!canonical || !duplicate) throw new Error('Both rows must exist to merge');
+  const patch = {};
+  if (!canonical.tmdb_id && duplicate.tmdb_id) patch.tmdb_id = duplicate.tmdb_id;
+  if (!canonical.imdb_id && duplicate.imdb_id) patch.imdb_id = duplicate.imdb_id;
+  if (!canonical.tvdb_id && duplicate.tvdb_id) patch.tvdb_id = duplicate.tvdb_id;
+  if (!canonical.title && duplicate.title) patch.title = duplicate.title;
+  if (!canonical.year && duplicate.year) patch.year = duplicate.year;
+  if (Object.keys(patch).length) {
+    const sets = Object.keys(patch).map((k) => `${k} = @${k}`).join(', ');
+    db.prepare(`UPDATE media SET ${sets}, updated_at = CURRENT_TIMESTAMP WHERE id = @id`).run({ ...patch, id: canonicalId });
+  }
+  db.prepare(`UPDATE request_log SET media_id = ? WHERE media_id = ?`).run(canonicalId, duplicateId);
+  db.prepare(`DELETE FROM media WHERE id = ?`).run(duplicateId); // cascades art / tpdb_match_cache / negative_cache for the duplicate
+  return getMediaById(canonicalId);
+}
+
 function searchMedia(query, limit = 50) {
   const like = `%${query}%`;
   return db
@@ -301,6 +351,8 @@ module.exports = {
   findOrCreateMedia,
   updateMediaMeta,
   getMediaById,
+  findPotentialDuplicates,
+  mergeMediaRows,
   searchMedia,
   listMedia,
   countMedia,

@@ -92,52 +92,43 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest fix - this was the real, root-cause bug behind the recurring "automatic path shows
-TMDB, browse/re-run chain show ThePosterDB fine" reports.** Traced (not guessed) to a caching
-architecture gap:
+**Latest update - diagnostics, not another guessed fix.** After the previous round's fix
+(opportunistic re-checking) visibly helped but didn't fully close out the "dashboard shows
+nothing for an item the logs mention" reports, a careful re-read of every write path in
+`resolveArt.js` couldn't find a further gap through code-reading alone - every failure branch
+does record something. Rather than ship another unverified theory, this update adds the tools to
+get a definitive answer instead:
 
-Once a poster resolves to anything, it's cached for up to `CACHE_TTL_DAYS_TMDB` days (30 by
-default) - and the resolver's very first check returns that cached art immediately without ever
-running the resolution chain (or ThePosterDB) again, for as long as that cache stays fresh. That
-means ThePosterDB effectively only ever got **one shot** at a title: whatever happened on its
-very first-ever resolution. If that one attempt lost - a transient network error, an old scraper
-bug that's since been fixed, ThePosterDB being briefly rate-limited - nothing would ever prompt a
-retry for up to a month, short of manually clicking "Re-run chain" (the only code path that
-bypasses that cache check). Every scraper fix in this whole thread was real and correct, but
-items that had already cached a non-TPDB poster before that fix landed had no way to benefit from
-it - which is exactly why the same handful of titles kept coming back.
+- **Duplicate media row detection.** If two requests for the same real item ever arrived with
+  non-overlapping id subsets *before* the cross-id reconciliation fix from a previous update was
+  in place, they could have already become two permanently separate database rows - one quietly
+  accumulating a ThePosterDB match while the other (the one actually being served) never does.
+  The admin dashboard now shows a warning banner on an item's detail page if any other row shares
+  one of its ids, with a one-click "Merge" action to combine them. This is the single most likely
+  remaining explanation and is now directly checkable rather than a guess.
+- **Raw diagnostics panel.** Every item's detail page now has a collapsible "Raw diagnostics"
+  section showing the exact, unfiltered database row and ThePosterDB verdict for that specific
+  internal id - useful for confirming whether what you're looking at in the dashboard is really
+  the same row Stremio is hitting.
+- **Unmistakable log line.** Every time a ThePosterDB check finishes with nothing to show, the
+  logs now include one line with the complete raw state: the exact title/ids used for the
+  search, and the exact database row (or `null`) read back immediately after writing. If a
+  future report shows this log line's ids not matching what the dashboard displays for "the same"
+  title, that's direct proof of a duplicate row; if it shows `null` where a value should be,
+  that's a genuine write failure worth investigating further; if it shows a fully-populated
+  verdict that still doesn't render on the dashboard, that narrows the bug to the display layer.
 
-Fixed: serving a cached poster is still just as fast as before, but if that poster isn't already
-from ThePosterDB (and isn't a manual override), a background check now runs alongside it to see
-if ThePosterDB has something better - gated by the same cooldown as everywhere else, so it only
-does real work when there's actually something new to try, and coalesced so a burst of requests
-for the same popular item doesn't schedule redundant checks. This should be the end of the "why
-does this specific title never update" pattern.
+If you hit this again: check the item's diagnostics panel and duplicate banner first. If a
+duplicate is found, merging it should resolve that item going forward. If no duplicate is found
+and the raw log line shows a populated, correct-looking verdict that still isn't rendering,
+that's genuinely useful evidence - please share it.
 
-As with any change that could affect standing verdicts, old cooldowns are cleared automatically
-on this restart - watch for `ThePosterDB scraper logic updated (v8) - cleared N remembered
-verdict(s)` in the startup logs. You shouldn't need to click "Re-run chain" on anything after
-this update; give it a little time (background checks are still rate-limited) and previously
-"stuck" items should upgrade on their own the next time they're requested.
-
-Also fixed: **duplicate media rows.** If two requests for the same item arrive with genuinely
-non-overlapping id subsets (one has only an imdb id, another only a tmdb id), the app now
-cross-references them via TMDB before creating a new row, so they converge on the same one
-instead of silently becoming two permanently separate items - one of which quietly accumulates
-progress (like a ThePosterDB match) while the other, the one actually being served, never does.
-
-Earlier fixes in this same update: a download failure after a successful ThePosterDB match was
-recorded as a silent "found" state with no error flag, so nothing showed on the dashboard. A
-misleading warning fired for titles that genuinely have zero posters uploaded. Multiple/duplicate
-ThePosterDB entries for the same title now get retried across up to `TPDB_MAX_ALTERNATE_TITLE_PAGES`
-matching pages. A new quality gate skips low-effort ThePosterDB posters on very new titles
-(`TPDB_MIN_CANDIDATES` / `TPDB_MIN_AGE_YEARS`). Admin overrides now respect your configured
-image sizes instead of downloading the browse-grid preview size.
-
-Further back: ThePosterDB's filter UI syncs to the page URL as real query parameters, so the
-scraper requests pages pre-filtered the way the site's own UI does it. Cheerio's `.text()`
-including `<script>`/`<style>` contents. ThePosterDB sitting behind Cloudflare and blocking this
-app's plain custom User-Agent.
+Earlier fixes in this update history (still active): opportunistic re-checking for cached
+non-TPDB posters so a bad first attempt doesn't stick for up to a month; a download failure after
+a successful match no longer being recorded as a silent "found" state; retrying across multiple
+matching ThePosterDB title pages; a candidate-count/age quality gate; ThePosterDB's real filter
+query parameters instead of per-candidate text scraping; presenting as a real browser to get past
+Cloudflare.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,

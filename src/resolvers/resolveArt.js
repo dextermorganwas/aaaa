@@ -180,6 +180,10 @@ async function applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label }) {
   const result = await tpdbPromise;
   if (!result) {
     const match = db.getTpdbMatch(mediaRow.id);
+    // Full raw state, always logged - if this ever again shows a mismatch with what the
+    // dashboard displays for "the same" item, it's proof of a media-row identity issue (see the
+    // duplicate-row detector in the admin dashboard) rather than a write that silently failed.
+    logger.info(`ThePosterDB ${label} raw state for media #${mediaRow.id} (title="${ctx.title || mediaRow.title}", tmdb:${mediaRow.tmdb_id} imdb:${mediaRow.imdb_id} tvdb:${mediaRow.tvdb_id}): ${JSON.stringify(match || null)}`);
     if (match && match.last_error_at) {
       logger.warn(`ThePosterDB ${label} for media #${mediaRow.id}: error - ${match.last_reason || 'unknown error'} (will retry automatically).`);
     } else {

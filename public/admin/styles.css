@@ -179,3 +179,40 @@ main { padding: 20px; max-width: 1400px; margin: 0 auto; }
 .toast.error { border-color: var(--danger); }
 
 .empty-state { color: var(--muted); padding: 40px; text-align: center; }
+
+.dup-banner {
+  background: #2a1f0e;
+  border: 1px solid #b8862f;
+  color: #f0d9a8;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.dup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.1);
+}
+.dup-row code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; margin-right: 4px; }
+
+.diagnostics {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.diagnostics summary { cursor: pointer; padding: 6px 0; }
+.diagnostics pre {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

@@ -140,6 +140,40 @@ async function openDetail(id) {
   detailView.classList.remove('hidden');
 }
 
+function duplicatesBannerHtml(media) {
+  const dupes = media.diagnostics?.duplicates || [];
+  if (!dupes.length) return '';
+  const rows = dupes
+    .map(
+      (d) => `
+      <div class="dup-row">
+        <span>#${d.id} - ${escapeHtml(d.title || '(untitled)')} ${d.year ? `(${d.year})` : ''}
+          <code>${d.tmdbId ? `tmdb:${d.tmdbId}` : ''}</code> <code>${d.imdbId || ''}</code> <code>${d.tvdbId ? `tvdb:${d.tvdbId}` : ''}</code>
+        </span>
+        <button class="btn" data-merge-id="${d.id}">Merge into this item (#${media.id})</button>
+      </div>`
+    )
+    .join('');
+  return `
+    <div class="dup-banner">
+      <strong>⚠ Possible duplicate item(s) found</strong> - these rows share an id with this one.
+      If Stremio's automatic requests use a different id combination than what you're viewing
+      here, they could be silently resolving against one of these instead, with its own separate
+      art cache and ThePosterDB history. Merging moves this row's missing ids/title over and
+      deletes the duplicate (its own art/ThePosterDB history is discarded).
+      ${rows}
+    </div>`;
+}
+
+function diagnosticsHtml(media) {
+  if (!media.diagnostics) return '';
+  return `
+    <details class="diagnostics">
+      <summary>Raw diagnostics (internal id #${media.id})</summary>
+      <pre>${escapeHtml(JSON.stringify({ media: media.diagnostics.rawMediaRow, tpdbMatch: media.diagnostics.rawTpdbMatch }, null, 2))}</pre>
+    </details>`;
+}
+
 function renderDetail(media) {
   const ids = [
     media.tmdbId && `<code>tmdb:${media.tmdbId}</code>`,
@@ -153,14 +187,19 @@ function renderDetail(media) {
       <div class="big-poster">${poster ? `<img src="${poster.url}" alt="">` : ''}</div>
       <div class="info">
         <h2>${escapeHtml(media.title || '(untitled)')} ${media.year ? `(${media.year})` : ''}</h2>
-        <div class="ids">${media.type} &middot; ${ids} ${media.originalLanguage ? `&middot; original language: ${media.originalLanguage}` : ''}</div>
+        <div class="ids">${media.type} &middot; ${ids} ${media.originalLanguage ? `&middot; original language: ${media.originalLanguage}` : ''} &middot; internal id #${media.id}</div>
       </div>
     </div>
+    ${duplicatesBannerHtml(media)}
     ${artSectionHtml(media, 'poster')}
     ${artSectionHtml(media, 'backdrop')}
     ${artSectionHtml(media, 'logo')}
+    ${diagnosticsHtml(media)}
   `;
 
+  detailContent.querySelectorAll('[data-merge-id]').forEach((btn) => {
+    btn.addEventListener('click', () => mergeDuplicate(media.id, Number(btn.dataset.mergeId)));
+  });
   detailContent.querySelectorAll('.art-type-section').forEach((section) => {
     const artType = section.dataset.artType;
     section.querySelector('[data-action="rerun"]').addEventListener('click', () => rerun(media.id, artType));
@@ -168,6 +207,18 @@ function renderDetail(media) {
     if (clearBtn) clearBtn.addEventListener('click', () => clearOverride(media.id, artType));
     section.querySelector('[data-action="browse"]').addEventListener('click', () => browse(media, artType, section));
   });
+}
+
+async function mergeDuplicate(mediaId, duplicateId) {
+  if (!confirm(`Merge item #${duplicateId} into #${mediaId}? This deletes #${duplicateId}'s own art/ThePosterDB history - it cannot be undone.`)) return;
+  showToast('Merging...');
+  try {
+    const res = await api(`/media/${mediaId}/merge`, { method: 'POST', body: JSON.stringify({ duplicateId }) });
+    renderDetail(res.media);
+    showToast('Merged. Consider clicking "Re-run chain" to refresh this item\'s art.');
+  } catch (e) {
+    showToast(e.message, true);
+  }
 }
 
 async function rerun(mediaId, artType) {

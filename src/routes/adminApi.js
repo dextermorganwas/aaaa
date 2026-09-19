@@ -12,10 +12,10 @@ const { fetchBuffer } = require('../lib/httpClient');
 const router = express.Router();
 router.use(express.json());
 
-function serializeMedia(row) {
+function serializeMedia(row, { includeDiagnostics = false } = {}) {
   const art = db.getArtForMedia(row.id);
   const tpdbMatch = row.type ? db.getTpdbMatch(row.id) : null;
-  return {
+  const base = {
     id: row.id,
     type: row.type,
     tmdbId: row.tmdb_id,
@@ -46,6 +46,27 @@ function serializeMedia(row) {
       url: `/api/admin/art-file/${row.id}/${a.art_type}`,
     })),
   };
+  if (!includeDiagnostics) return base;
+
+  // Full, unfiltered view of what's actually in the database for this item - added so an issue
+  // can be verified directly instead of inferred from the (necessarily simplified) fields above.
+  const duplicates = db.findPotentialDuplicates(row);
+  return {
+    ...base,
+    diagnostics: {
+      rawMediaRow: row,
+      rawTpdbMatch: tpdbMatch || null,
+      duplicates: duplicates.map((d) => ({
+        id: d.id,
+        title: d.title,
+        year: d.year,
+        tmdbId: d.tmdb_id,
+        imdbId: d.imdb_id,
+        tvdbId: d.tvdb_id,
+        updatedAt: d.updated_at,
+      })),
+    },
+  };
 }
 
 router.get('/stats', (req, res) => {
@@ -64,7 +85,22 @@ router.get('/media', (req, res) => {
 router.get('/media/:id', (req, res) => {
   const row = db.getMediaById(Number(req.params.id));
   if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json(serializeMedia(row));
+  res.json(serializeMedia(row, { includeDiagnostics: true }));
+});
+
+router.post('/media/:id/merge', (req, res) => {
+  const row = db.getMediaById(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  const { duplicateId } = req.body || {};
+  const dup = db.getMediaById(Number(duplicateId));
+  if (!dup) return res.status(400).json({ error: 'duplicateId must reference an existing item' });
+  try {
+    db.mergeMediaRows(row.id, dup.id);
+    res.json({ ok: true, media: serializeMedia(db.getMediaById(row.id), { includeDiagnostics: true }) });
+  } catch (e) {
+    logger.error('merge failed', e);
+    res.status(500).json({ error: 'Failed to merge', detail: e.message });
+  }
 });
 
 router.get('/media/:id/browse', async (req, res) => {
