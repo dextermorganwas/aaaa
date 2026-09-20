@@ -14,25 +14,54 @@ const UA = 'stremio-art-bridge/1.0 (+self-hosted; https://github.com/)';
  * fetch() with a hard timeout and a shared concurrency gate.
  * Throws on non-2xx by default (set allow404 to treat 404 as a soft "null" instead of throwing).
  */
-async function limitedFetch(url, { timeoutMs = 8000, headers = {}, allow404 = false, method = 'GET', body } = {}) {
+const RETRYABLE_STATUSES = new Set([429, 503]);
+
+function parseRetryAfter(res) {
+  const header = res.headers.get('retry-after');
+  if (!header) return null;
+  const asSeconds = Number(header);
+  if (Number.isFinite(asSeconds)) return asSeconds * 1000;
+  const asDate = Date.parse(header);
+  return Number.isFinite(asDate) ? Math.max(0, asDate - Date.now()) : null;
+}
+
+async function limitedFetch(url, { timeoutMs = 8000, headers = {}, allow404 = false, method = 'GET', body, maxRetries = 3 } = {}) {
   return limit(async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, {
-        method,
-        body,
-        headers: { 'User-Agent': UA, ...headers },
-        signal: controller.signal,
-      });
+    for (let attempt = 0; ; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res;
+      try {
+        res = await fetch(url, {
+          method,
+          body,
+          headers: { 'User-Agent': UA, ...headers },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
       if (res.status === 404 && allow404) return null;
+
+      // A 429/503 is the server telling us to slow down, not a permanent failure - retrying
+      // with backoff (honoring Retry-After when the server sends one) is the correct response,
+      // not an immediate error. Treating this as fatal was the actual cause of ThePosterDB
+      // backfills failing in bursts (e.g. right after a restart, when several items need
+      // checking around the same time) - the throttle/concurrency limits reduce how often this
+      // happens, but can't eliminate it, so it needs to be handled gracefully when it does.
+      if (RETRYABLE_STATUSES.has(res.status) && attempt < maxRetries) {
+        const waitMs = Math.min(parseRetryAfter(res) || 1000 * 2 ** attempt, 30000);
+        logger.warn(`HTTP ${res.status} from ${url} - retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${maxRetries}).`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
+
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         throw new Error(`HTTP ${res.status} for ${url}: ${text.slice(0, 200)}`);
       }
       return res;
-    } finally {
-      clearTimeout(timer);
     }
   });
 }

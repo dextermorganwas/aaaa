@@ -79,12 +79,12 @@ module.exports = {
   // ThePosterDB has no official API and no rate-limit contract, so its own concurrency cap is
   // intentionally lower and separate from MAX_CONCURRENT_FETCHES (which also serves TMDB/TVDB,
   // both fine with more parallel load). This is the main lever for how fast this app hits TPDB.
-  tpdbMaxConcurrent: int(process.env.TPDB_MAX_CONCURRENT, 3),
+  tpdbMaxConcurrent: int(process.env.TPDB_MAX_CONCURRENT, 2),
   // Minimum spacing (ms) between consecutive ThePosterDB requests, on top of the concurrency
   // cap above - concurrency alone doesn't bound total throughput over time, this does. With the
   // current scraper (2-3 requests per title resolution), the default keeps steady-state
   // throughput to roughly 3-4 requests/second even under a large catalog-scan burst.
-  tpdbMinRequestIntervalMs: int(process.env.TPDB_MIN_REQUEST_INTERVAL_MS, 300),
+  tpdbMinRequestIntervalMs: int(process.env.TPDB_MIN_REQUEST_INTERVAL_MS, 500),
 
   // --- ThePosterDB "quality gate" ---
   // A ThePosterDB poster is only used if the title has at least this many English/Original

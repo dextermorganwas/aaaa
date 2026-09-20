@@ -92,38 +92,35 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest update - found the real mechanism behind the write gap, with a guaranteed fix this
-time.** Your last log capture was the key: 15 different items, for completely different titles,
-all "finishing" at the exact same millisecond with nothing written to the database for any of
-them. Real network-throttled searches (built to be spaced at least 300ms apart) cannot possibly
-all complete within the same millisecond - that pattern only makes sense if something fails
-*before* any real work happens, uniformly, for all of them at once. The prime suspect: an
-exception being thrown and silently swallowed. Checked the code and found exactly that -
-`resolvePosterViaTpdb`'s outer error handler was logging only `e.message` at **debug** level
-(invisible with the default log level) and nothing else, which is precisely the shape of bug that
-would hide a real, repeatable exception indefinitely.
+**Latest update - confirmed root cause, with proof this time.** The new error logging worked
+exactly as intended: the exception was `HTTP 429 for .../api/assets/{id}/view` - ThePosterDB
+genuinely rate-limiting this app, specifically on the image-download endpoint, during a burst
+(several items all needing a ThePosterDB check around the same time, e.g. right after a
+restart). This wasn't a code bug so much as a missing capability: a 429 is a server telling you
+to slow down and retry, not a permanent failure, and it was being treated as the latter.
 
-Fixed two ways, so this can't happen invisibly again regardless of what the underlying exception
-turns out to be:
-- That handler now logs the **full error object and stack trace at error level** (always
-  visible), tagged with the exact media id and title, so the next occurrence will show you
-  exactly which line threw and why.
-- It also now writes a fallback error record to the database itself, so **even if something
-  throws before ThePosterDB's own internal write runs, the dashboard will still show something**
-  instead of silently nothing. This closes the "dashboard shows nothing at all" symptom as a
-  guaranteed safety net, independent of whatever the root cause of the exception turns out to be.
+Fixed properly: **any 429 or 503 response, from any provider, is now retried automatically with
+backoff** (honoring the server's `Retry-After` header when it sends one, otherwise exponential
+backoff up to 30s, up to 3 attempts) instead of failing outright. ThePosterDB's own concurrency
+and spacing limits are also more conservative now (`TPDB_MAX_CONCURRENT` 3→2,
+`TPDB_MIN_REQUEST_INTERVAL_MS` 300→500) to make hitting this in the first place less likely. If
+you still see 429s in the logs occasionally, that's now expected and handled gracefully (a short
+automatic retry) rather than a failure - only raise `TPDB_MIN_REQUEST_INTERVAL_MS` further if
+they're frequent enough to be visibly slowing things down.
 
-If you see this again, the logs should now show a line starting with `ThePosterDB resolution
-threw for media #X` with a full stack trace - please share that verbatim if so, since it should
-point at the exact cause directly rather than needing another round of inference.
+This closes the loop on the multi-round "dashboard shows nothing / no qualifying poster found"
+investigation: duplicate-row detection and the write-failure safety net from recent updates
+remain in place as real, independent fixes, but this rate-limit handling was the actual trigger
+behind the specific burst pattern reported.
 
 Earlier in this same update: duplicate media row detection with a one-click merge in the admin
-dashboard, a raw diagnostics panel on every item's detail page, and opportunistic re-checking so
-a cached non-TPDB poster doesn't block ThePosterDB from ever getting another chance for up to a
-month. Further back: a download failure after a successful match no longer silently recorded as
-"found"; retrying across multiple matching ThePosterDB title pages; a candidate-count/age quality
-gate; ThePosterDB's real filter query parameters instead of per-candidate text scraping;
-presenting as a real browser to get past Cloudflare.
+dashboard, a raw diagnostics panel on every item's detail page, opportunistic re-checking so a
+cached non-TPDB poster doesn't block ThePosterDB from ever getting another chance for up to a
+month, and a guaranteed fallback error record so an unhandled exception can never again leave the
+dashboard showing nothing. Further back: a download failure after a successful match no longer
+silently recorded as "found"; retrying across multiple matching ThePosterDB title pages; a
+candidate-count/age quality gate; ThePosterDB's real filter query parameters instead of
+per-candidate text scraping; presenting as a real browser to get past Cloudflare.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,
