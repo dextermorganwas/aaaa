@@ -92,43 +92,38 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest update - diagnostics, not another guessed fix.** After the previous round's fix
-(opportunistic re-checking) visibly helped but didn't fully close out the "dashboard shows
-nothing for an item the logs mention" reports, a careful re-read of every write path in
-`resolveArt.js` couldn't find a further gap through code-reading alone - every failure branch
-does record something. Rather than ship another unverified theory, this update adds the tools to
-get a definitive answer instead:
+**Latest update - found the real mechanism behind the write gap, with a guaranteed fix this
+time.** Your last log capture was the key: 15 different items, for completely different titles,
+all "finishing" at the exact same millisecond with nothing written to the database for any of
+them. Real network-throttled searches (built to be spaced at least 300ms apart) cannot possibly
+all complete within the same millisecond - that pattern only makes sense if something fails
+*before* any real work happens, uniformly, for all of them at once. The prime suspect: an
+exception being thrown and silently swallowed. Checked the code and found exactly that -
+`resolvePosterViaTpdb`'s outer error handler was logging only `e.message` at **debug** level
+(invisible with the default log level) and nothing else, which is precisely the shape of bug that
+would hide a real, repeatable exception indefinitely.
 
-- **Duplicate media row detection.** If two requests for the same real item ever arrived with
-  non-overlapping id subsets *before* the cross-id reconciliation fix from a previous update was
-  in place, they could have already become two permanently separate database rows - one quietly
-  accumulating a ThePosterDB match while the other (the one actually being served) never does.
-  The admin dashboard now shows a warning banner on an item's detail page if any other row shares
-  one of its ids, with a one-click "Merge" action to combine them. This is the single most likely
-  remaining explanation and is now directly checkable rather than a guess.
-- **Raw diagnostics panel.** Every item's detail page now has a collapsible "Raw diagnostics"
-  section showing the exact, unfiltered database row and ThePosterDB verdict for that specific
-  internal id - useful for confirming whether what you're looking at in the dashboard is really
-  the same row Stremio is hitting.
-- **Unmistakable log line.** Every time a ThePosterDB check finishes with nothing to show, the
-  logs now include one line with the complete raw state: the exact title/ids used for the
-  search, and the exact database row (or `null`) read back immediately after writing. If a
-  future report shows this log line's ids not matching what the dashboard displays for "the same"
-  title, that's direct proof of a duplicate row; if it shows `null` where a value should be,
-  that's a genuine write failure worth investigating further; if it shows a fully-populated
-  verdict that still doesn't render on the dashboard, that narrows the bug to the display layer.
+Fixed two ways, so this can't happen invisibly again regardless of what the underlying exception
+turns out to be:
+- That handler now logs the **full error object and stack trace at error level** (always
+  visible), tagged with the exact media id and title, so the next occurrence will show you
+  exactly which line threw and why.
+- It also now writes a fallback error record to the database itself, so **even if something
+  throws before ThePosterDB's own internal write runs, the dashboard will still show something**
+  instead of silently nothing. This closes the "dashboard shows nothing at all" symptom as a
+  guaranteed safety net, independent of whatever the root cause of the exception turns out to be.
 
-If you hit this again: check the item's diagnostics panel and duplicate banner first. If a
-duplicate is found, merging it should resolve that item going forward. If no duplicate is found
-and the raw log line shows a populated, correct-looking verdict that still isn't rendering,
-that's genuinely useful evidence - please share it.
+If you see this again, the logs should now show a line starting with `ThePosterDB resolution
+threw for media #X` with a full stack trace - please share that verbatim if so, since it should
+point at the exact cause directly rather than needing another round of inference.
 
-Earlier fixes in this update history (still active): opportunistic re-checking for cached
-non-TPDB posters so a bad first attempt doesn't stick for up to a month; a download failure after
-a successful match no longer being recorded as a silent "found" state; retrying across multiple
-matching ThePosterDB title pages; a candidate-count/age quality gate; ThePosterDB's real filter
-query parameters instead of per-candidate text scraping; presenting as a real browser to get past
-Cloudflare.
+Earlier in this same update: duplicate media row detection with a one-click merge in the admin
+dashboard, a raw diagnostics panel on every item's detail page, and opportunistic re-checking so
+a cached non-TPDB poster doesn't block ThePosterDB from ever getting another chance for up to a
+month. Further back: a download failure after a successful match no longer silently recorded as
+"found"; retrying across multiple matching ThePosterDB title pages; a candidate-count/age quality
+gate; ThePosterDB's real filter query parameters instead of per-candidate text scraping;
+presenting as a real browser to get past Cloudflare.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,

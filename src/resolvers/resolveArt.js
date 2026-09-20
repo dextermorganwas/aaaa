@@ -207,6 +207,27 @@ async function applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label }) {
  *  response down, but gives ThePosterDB another chance in the background, gated by the same
  *  cooldown as everywhere else so it only actually does work when there's something new to try. */
 const opportunisticTpdbInFlight = new Set();
+/** Wraps resolvePosterViaTpdb so an exception can never disappear silently: logs the full error
+ *  (not just its message) at error level, and writes a fallback error record so the dashboard
+ *  always has something to show even if the failure happened before resolvePosterViaTpdb's own
+ *  internal writes. This used to log at debug (invisible by default) with just e.message, which
+ *  almost certainly hid the real cause behind "logs show a generic miss, nothing written to the
+ *  DB at all" reports - if something throws before reaching an internal write, this is the only
+ *  place that would ever see it. */
+async function safeResolvePosterViaTpdb(mediaRow, ctx) {
+  try {
+    return await resolvePosterViaTpdb(mediaRow, ctx);
+  } catch (e) {
+    logger.error(`ThePosterDB resolution threw for media #${mediaRow.id} (title="${ctx.title || mediaRow.title}"):`, e);
+    try {
+      db.setTpdbError(mediaRow.id, `unhandled exception: ${e.message}`);
+    } catch (writeErr) {
+      logger.error(`ThePosterDB: even the fallback error-write failed for media #${mediaRow.id}:`, writeErr);
+    }
+    return null;
+  }
+}
+
 function scheduleOpportunisticTpdbCheck(mediaRow) {
   if (tpdbIsOnCooldown(mediaRow.id)) return;
   // A burst of near-simultaneous requests for the same popular item would otherwise each
@@ -217,10 +238,7 @@ function scheduleOpportunisticTpdbCheck(mediaRow) {
   background.schedule(`tpdb-recheck-${mediaRow.id}`, async () => {
     try {
       const ctx = { type: mediaRow.type, title: mediaRow.title, year: mediaRow.year, tmdbId: mediaRow.tmdb_id, imdbId: mediaRow.imdb_id, tvdbId: mediaRow.tvdb_id };
-      const tpdbPromise = resolvePosterViaTpdb(mediaRow, ctx).catch((e) => {
-        logger.debug('TPDB opportunistic re-check errored:', e.message);
-        return null;
-      });
+      const tpdbPromise = safeResolvePosterViaTpdb(mediaRow, ctx);
       await applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label: 're-check' });
     } finally {
       opportunisticTpdbInFlight.delete(mediaRow.id);
@@ -285,10 +303,7 @@ async function resolvePoster(mediaRow, ctx) {
     return resolvePosterRestOfChain(mediaRow, ctx);
   }
 
-  const tpdbPromise = resolvePosterViaTpdb(mediaRow, ctx).catch((e) => {
-    logger.debug('TPDB poster resolution errored:', e.message);
-    return null;
-  });
+  const tpdbPromise = safeResolvePosterViaTpdb(mediaRow, ctx);
 
   function scheduleBackfill() {
     background.schedule(`tpdb-backfill-${mediaRow.id}`, () => applyTpdbResultOrLog(mediaRow, ctx, tpdbPromise, { label: 'backfill' }));
