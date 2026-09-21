@@ -86,16 +86,19 @@ module.exports = {
   // throughput to roughly 3-4 requests/second even under a large catalog-scan burst.
   tpdbMinRequestIntervalMs: int(process.env.TPDB_MIN_REQUEST_INTERVAL_MS, 500),
 
-  // --- ThePosterDB "quality gate" ---
-  // A ThePosterDB poster is only used if the title has at least this many English/Original
-  // candidates to choose from (more candidates tends to mean more community curation and a
-  // better pick)...
-  tpdbMinCandidates: int(process.env.TPDB_MIN_CANDIDATES, 3),
-  // ...OR the title is at least this many years old (newer titles with few uploads tend to have
-  // lower-quality posters; that risk goes away once a title's had time to accumulate real
-  // community attention). Either condition passing is enough.
-  tpdbMinAgeYears: int(process.env.TPDB_MIN_AGE_YEARS, 3),
-  tpdbQualityGateEnabled: bool(process.env.TPDB_QUALITY_GATE_ENABLED, true),
+  // --- ThePosterDB "low-effort template" style check ---
+  // Replaces an earlier candidate-count/age heuristic with an actual check of the image itself:
+  // detects the common style of a plain/textless promo image framed by a thin uniform (usually
+  // white) border. When detected, the next candidate is tried instead; if every checked
+  // candidate matches, whatever art was already being served is kept rather than replaced with
+  // a low-effort pick.
+  tpdbStyleCheckEnabled: bool(process.env.TPDB_STYLE_CHECK_ENABLED, true),
+  // How many top (Downloads-sorted) candidates to download and check per title before giving up
+  // and falling through - each one costs an extra image download, so keep this modest.
+  tpdbStyleCheckMaxCandidates: int(process.env.TPDB_STYLE_CHECK_MAX_CANDIDATES, 5),
+  // Fraction of pixels in each edge strip that must be near-white for that edge to count as
+  // "bordered" (needs 3 of 4 edges to flag the image as framed). Lower = more lenient/eager.
+  tpdbStyleBorderThreshold: Number(process.env.TPDB_STYLE_BORDER_THRESHOLD) || 0.85,
 
   // --- ThePosterDB search breadth ---
   // Some titles have more than one matching disambiguation page on ThePosterDB (duplicate/near-

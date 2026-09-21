@@ -147,15 +147,11 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
     return null;
   }
 
-  const dl = await tpdb.downloadPoster(result.assetId);
-  if (!dl) {
-    // A qualifying poster WAS found - the download itself failed (network blip, TPDB briefly
-    // rate-limiting the asset endpoint, etc). This is an error, not a "not found": recording it
-    // as not_found would be wrong (a real match exists) and would incorrectly suppress retries
-    // for days. This was the exact bug behind "logs say no qualifying poster found, but browse
-    // finds one and the dashboard shows nothing at all" - the match succeeded, the download
-    // silently didn't, and nothing recorded why.
-    db.setTpdbError(mediaRow.id, 'found a qualifying poster but the image download failed');
+  // findEnglishOriginalPoster already downloaded the winning candidate as part of checking it
+  // against the low-effort-template style filter (see theposterdb.js) - no need to fetch it
+  // again here. A missing buffer at this point would be an internal bug, not a normal failure.
+  if (!result.buffer) {
+    db.setTpdbError(mediaRow.id, 'internal error: matched a poster but no image data was attached to the result');
     return null;
   }
   // A genuine match was found and downloaded - record it as such (not "not found").
@@ -163,9 +159,9 @@ async function resolvePosterViaTpdb(mediaRow, ctx) {
   return {
     source: 'theposterdb',
     sourceRef: result.assetId,
-    sourceUrl: dl.sourceUrl,
-    buffer: dl.buffer,
-    contentType: dl.contentType,
+    sourceUrl: result.sourceUrl,
+    buffer: result.buffer,
+    contentType: result.contentType,
     language: result.language,
     reason: `ThePosterDB: English, Original variation${ctx.type === 'series' ? ', Show Cover' : ''}, top result by Downloads`,
   };

@@ -92,35 +92,32 @@ box is reachable from the internet.
 
 ## Upgrading an existing deployment
 
-**Latest update - confirmed root cause, with proof this time.** The new error logging worked
-exactly as intended: the exception was `HTTP 429 for .../api/assets/{id}/view` - ThePosterDB
-genuinely rate-limiting this app, specifically on the image-download endpoint, during a burst
-(several items all needing a ThePosterDB check around the same time, e.g. right after a
-restart). This wasn't a code bug so much as a missing capability: a 429 is a server telling you
-to slow down and retry, not a permanent failure, and it was being treated as the latter.
+**Latest update - simplified the style check to border-only, per feedback.** The previous
+version required both a border AND a flat dark bottom bar to flag a poster. That's now just the
+border check - simpler, and matches what was actually wanted rather than something I'd added
+speculatively.
 
-Fixed properly: **any 429 or 503 response, from any provider, is now retried automatically with
-backoff** (honoring the server's `Retry-After` header when it sends one, otherwise exponential
-backoff up to 30s, up to 3 attempts) instead of failing outright. ThePosterDB's own concurrency
-and spacing limits are also more conservative now (`TPDB_MAX_CONCURRENT` 3→2,
-`TPDB_MIN_REQUEST_INTERVAL_MS` 300→500) to make hitting this in the first place less likely. If
-you still see 429s in the logs occasionally, that's now expected and handled gracefully (a short
-automatic retry) rather than a failure - only raise `TPDB_MIN_REQUEST_INTERVAL_MS` further if
-they're frequent enough to be visibly slowing things down.
+Earlier in this update history: the candidate-count/age quality gate was replaced with an actual
+visual check for the low-effort "plain border" template style, downloading and checking up to
+`TPDB_STYLE_CHECK_MAX_CANDIDATES` (default 5) candidates until one passes, keeping existing/
+fallback art if none do (uses the `sharp` image library, added as a dependency - ships prebuilt
+binaries, no extra system packages needed). **Same caveat as before applies:** this is a
+heuristic reasoned from examples, not validated against a large real sample - every skip is
+logged with the measured edge count (`ThePosterDB: skipping candidate N ... (white edges: X/4)`),
+and that same info shows up in the dashboard's reason text when every candidate for a title gets
+skipped. Tune `TPDB_STYLE_BORDER_THRESHOLD` in `.env` based on what you actually see, or set
+`TPDB_STYLE_CHECK_ENABLED=false` to turn it off entirely.
 
-This closes the loop on the multi-round "dashboard shows nothing / no qualifying poster found"
-investigation: duplicate-row detection and the write-failure safety net from recent updates
-remain in place as real, independent fixes, but this rate-limit handling was the actual trigger
-behind the specific burst pattern reported.
+As with any change to ThePosterDB's matching logic, old remembered verdicts are cleared
+automatically on this restart - watch for `ThePosterDB scraper logic updated (v10) - cleared N
+remembered verdict(s)` in the startup logs.
 
-Earlier in this same update: duplicate media row detection with a one-click merge in the admin
-dashboard, a raw diagnostics panel on every item's detail page, opportunistic re-checking so a
-cached non-TPDB poster doesn't block ThePosterDB from ever getting another chance for up to a
-month, and a guaranteed fallback error record so an unhandled exception can never again leave the
-dashboard showing nothing. Further back: a download failure after a successful match no longer
-silently recorded as "found"; retrying across multiple matching ThePosterDB title pages; a
-candidate-count/age quality gate; ThePosterDB's real filter query parameters instead of
-per-candidate text scraping; presenting as a real browser to get past Cloudflare.
+Further back in this update history: a confirmed root cause for backfills failing in bursts
+(ThePosterDB rate-limiting the image endpoint, now retried automatically with backoff); duplicate
+media row detection with a one-click merge in the admin dashboard; a raw diagnostics panel on
+every item; opportunistic re-checking so a cached non-TPDB poster doesn't block ThePosterDB for
+up to a month; a guaranteed fallback error record so an unhandled exception can never again leave
+the dashboard showing nothing.
 
 This also changes the database schema (adds a `reason` column and a couple of new tables) and
 migrates your existing `./data/db` in place automatically on startup - no manual steps needed,
